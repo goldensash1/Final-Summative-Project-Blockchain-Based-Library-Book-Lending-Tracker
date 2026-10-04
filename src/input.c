@@ -81,3 +81,37 @@ void to_upper_trim(char *s) {
     }
     s[j] = '\0';
 }
+
+void trim_spaces(char *s) {
+    char *start = s;
+    while (isspace((unsigned char)*start)) start++;
+    size_t len = strlen(start);
+    while (len > 0 && isspace((unsigned char)start[len - 1])) len--;
+    memmove(s, start, len);
+    s[len] = '\0';
+}
+
+int prompt_id(const char *prompt, char *buf, size_t size) {
+    if (read_line(prompt, buf, size) != INPUT_OK) return 0;
+    to_upper_trim(buf);
+    return 1;
+}
+
+int prompt_int_range(const char *prompt, int min, int max, int default_value, int *out) {
+    for (;;) {
+        char buf[32];
+        int rc = read_line(prompt, buf, sizeof(buf));
+        if (rc == INPUT_EOF) return 0;
+
+        int value;
+        if (rc == INPUT_OK && buf[0] == '\0' && default_value >= min && default_value <= max) {
+            *out = default_value;
+            return 1;
+        }
+        if (rc == INPUT_OK && parse_int(buf, &value) && value >= min && value <= max) {
+            *out = value;
+            return 1;
+        }
+        printf("ERROR: Please enter a number from %d to %d.\n", min, max);
+    }
+}

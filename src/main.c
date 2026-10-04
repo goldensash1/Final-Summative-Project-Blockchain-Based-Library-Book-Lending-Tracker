@@ -1,362 +1,267 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <time.h>
 
-#include "registry.h"
-#include "crypto.h"
-#include "auth.h"
+#include "app.h"
 #include "input.h"
-#include "blockchain.h"
+#include "lending.h"
+#include "tokens.h"
+#include "mining.h"
 
-#define BOOKS_FILE "books.txt"
-#define MEMBERS_FILE "members.txt"
-#define CHAIN_FILE "chain.dat"
-#define USERS_FILE "users.dat"
-#define LOAN_PERIOD_DAYS 14
+/* Command-line options. */
+typedef struct {
+    int model;          /* MODEL_UTXO / MODEL_ACCOUNT, or -1 to ask at startup */
+    int difficulty;
+    int seed_set;
+    unsigned int seed;
+} Options;
 
-static void print_menu(const Session *s) {
-    printf("\n===== Blockchain Library Lending Tracker =====\n");
-    printf("Logged in as: %s (%s)\n", s->username, auth_role_name(s->role));
-    printf("1. Borrow Book\n");
-    printf("2. Return Book\n");
-    printf("3. Mark Book Overdue\n");
-    printf("4. View Lending Records\n");
-    printf("5. Validate Chain\n");
-    printf("6. Tamper With a Block (demo) [ADMIN]\n");
-    printf("7. Add User Account [ADMIN]\n");
-    printf("8. List Books\n");
-    printf("9. List Members\n");
-    printf("10. Exit\n");
+static void print_usage(const char *prog) {
+    printf("Usage: %s [--model utxo|account] [--difficulty 1-4] [--seed N]\n\n", prog);
+    printf("  -m, --model       transaction model for the whole session (asked at startup if omitted)\n");
+    printf("  -d, --difficulty  proof-of-work difficulty = leading zero hex digits (default %d)\n",
+           DEFAULT_DIFFICULTY);
+    printf("  -s, --seed        random seed for the pool miners' hash rates (default: time)\n");
+    printf("  -h, --help        show this help\n");
 }
 
-static int require_admin(const Session *s) {
-    if (s->role == ROLE_ADMIN) return 1;
-    printf("ERROR: Access denied. This action requires the ADMIN role.\n");
-    return 0;
+/* Matches "-x value", "--long value" or "--long=value". Returns the value,
+ * "" if the value is missing, or NULL if `argv[*i]` is a different flag. */
+static const char *flag_value(int argc, char **argv, int *i, const char *short_name,
+                              const char *long_name) {
+    const char *arg = argv[*i];
+    if (!arg) return NULL;
+    size_t long_len = strlen(long_name);
+    if (strncmp(arg, long_name, long_len) == 0 && arg[long_len] == '=') return arg + long_len + 1;
+    if (strcmp(arg, short_name) == 0 || strcmp(arg, long_name) == 0) {
+        return *i + 1 < argc ? argv[++*i] : "";
+    }
+    return NULL;
 }
 
-static void print_validation_result(ChainValidationResult result, int bad_index, int count) {
-    switch (result) {
-        case CHAIN_VALID:
-            printf("Chain is VALID. All %d blocks verified: hashes correct, links intact, "
-                   "signatures valid.\n", count);
-            break;
-        case CHAIN_BAD_HASH:
-            printf("Chain is INVALID: block #%d's stored hash does not match its recomputed "
-                   "hash (data was tampered with).\n", bad_index);
-            break;
-        case CHAIN_BROKEN_LINK:
-            printf("Chain is INVALID: block #%d's previous_hash does not match the preceding "
-                   "block's hash (chain link broken).\n", bad_index);
-            break;
-        case CHAIN_BAD_SIGNATURE:
-            printf("Chain is INVALID: block #%d's digital signature does not verify with "
-                   "its signer's public key.\n", bad_index);
-            break;
-    }
-}
+/* Returns 1 to run, 0 to exit successfully (--help), -1 on a bad argument. */
+static int parse_args(int argc, char **argv, Options *opt) {
+    opt->model = -1;
+    opt->difficulty = DEFAULT_DIFFICULTY;
+    opt->seed_set = 0;
+    opt->seed = 0;
 
-/* Never build on top of a tampered chain: that would both hide the tampering
- * and persist it to disk on the next save. */
-static int ensure_chain_intact(Blockchain *chain) {
-    int bad_index = -1;
-    ChainValidationResult result = chain_validate(chain, &bad_index);
-    if (result == CHAIN_VALID) return 1;
+    for (int i = 1; i < argc; i++) {
+        const char *value;
+        int n;
 
-    print_validation_result(result, bad_index, chain->count);
-    printf("ERROR: Refusing to add blocks to an invalid chain. Restart the program to reload "
-           "the saved chain, or restore '%s' from a trusted copy.\n", CHAIN_FILE);
-    return 0;
-}
-
-/* Prompts for an ID and normalises it. Returns 0 if input was aborted. */
-static int prompt_id(const char *prompt, char *buf, size_t size) {
-    if (read_line(prompt, buf, size) != INPUT_OK) return 0;
-    to_upper_trim(buf);
-    return 1;
-}
-
-static int append_and_save(Blockchain *chain, const Session *s, const Book *book,
-                           const char *member_id, const char *member_name, const char *action) {
-    if (!chain_add_block(chain, book->book_id, book->title, member_id, member_name,
-                         action, s->username, s->signing_key)) {
-        printf("ERROR: Failed to create and sign block\n");
-        return 0;
-    }
-    if (!chain_save(chain, CHAIN_FILE)) {
-        printf("WARNING: Block #%d is in memory but could not be saved to disk\n",
-               chain->count - 1);
-    }
-    return 1;
-}
-
-static void do_borrow(Blockchain *chain, Registry *reg, const Session *s) {
-    char book_id[20], member_id[20];
-    if (!prompt_id("Enter Book ID: ", book_id, sizeof(book_id))) return;
-    if (!prompt_id("Enter Member ID: ", member_id, sizeof(member_id))) return;
-
-    Book *book = registry_find_book(reg, book_id);
-    Member *member = registry_find_member(reg, member_id);
-    if (!book || !member) {
-        printf("ERROR: Book or Member not found\n");
-        return;
-    }
-
-    if (chain_find_active_loan(chain, book->book_id) != NULL) {
-        printf("ERROR: Book '%s' is already on loan and has not been returned\n", book->title);
-        return;
-    }
-
-    if (!ensure_chain_intact(chain)) return;
-    if (append_and_save(chain, s, book, member->member_id, member->full_name, "BORROWED")) {
-        printf("SUCCESS: '%s' borrowed by %s. Block #%d added and signed by %s.\n",
-               book->title, member->full_name, chain->count - 1, s->username);
-    }
-}
-
-static void do_return(Blockchain *chain, Registry *reg, const Session *s) {
-    char book_id[20], member_id[20];
-    if (!prompt_id("Enter Book ID: ", book_id, sizeof(book_id))) return;
-    if (!prompt_id("Enter Member ID: ", member_id, sizeof(member_id))) return;
-
-    Book *book = registry_find_book(reg, book_id);
-    Member *member = registry_find_member(reg, member_id);
-    if (!book || !member) {
-        printf("ERROR: Book or Member not found\n");
-        return;
-    }
-
-    Block *loan = chain_find_active_loan(chain, book->book_id);
-    if (!loan) {
-        printf("ERROR: No active loan found for book '%s' (never borrowed, or already returned)\n",
-               book->title);
-        return;
-    }
-
-    if (strcmp(loan->member_id, member->member_id) != 0) {
-        printf("ERROR: '%s' is on loan to %s (%s), not %s (%s)\n", book->title,
-               loan->member_name, loan->member_id, member->full_name, member->member_id);
-        return;
-    }
-
-    if (!ensure_chain_intact(chain)) return;
-    if (append_and_save(chain, s, book, member->member_id, member->full_name, "RETURNED")) {
-        printf("SUCCESS: '%s' returned by %s. Block #%d added and signed by %s.\n",
-               book->title, member->full_name, chain->count - 1, s->username);
-    }
-}
-
-static void do_overdue(Blockchain *chain, Registry *reg, const Session *s) {
-    char book_id[20];
-    if (!prompt_id("Enter Book ID: ", book_id, sizeof(book_id))) return;
-
-    Book *book = registry_find_book(reg, book_id);
-    if (!book) {
-        printf("ERROR: Book or Member not found\n");
-        return;
-    }
-
-    Block *loan = chain_find_active_loan(chain, book->book_id);
-    if (!loan) {
-        printf("ERROR: Book '%s' is not currently on loan\n", book->title);
-        return;
-    }
-
-    Block *latest = chain_latest_for_book(chain, book->book_id);
-    if (latest && strcmp(latest->action, "OVERDUE") == 0) {
-        printf("ERROR: Book '%s' is already marked OVERDUE\n", book->title);
-        return;
-    }
-
-    long days = (long)((time(NULL) - loan->timestamp) / 86400);
-    printf("'%s' has been on loan to %s for %ld day(s) (loan period: %d days).\n",
-           book->title, loan->member_name, days, LOAN_PERIOD_DAYS);
-
-    if (!ensure_chain_intact(chain)) return;
-    if (append_and_save(chain, s, book, loan->member_id, loan->member_name, "OVERDUE")) {
-        printf("SUCCESS: '%s' marked OVERDUE for %s. Block #%d added and signed by %s.\n",
-               book->title, loan->member_name, chain->count - 1, s->username);
-    }
-}
-
-/* Fills `out` with a book's current status, worked out from the chain. */
-static void describe_book_status(Blockchain *chain, const Book *book, char *out, size_t size) {
-    Block *loan = chain_find_active_loan(chain, book->book_id);
-    if (!loan) {
-        snprintf(out, size, "Available");
-        return;
-    }
-    Block *latest = chain_latest_for_book(chain, book->book_id);
-    int overdue = latest && strcmp(latest->action, "OVERDUE") == 0;
-    snprintf(out, size, "%s: %s (%s)", overdue ? "OVERDUE" : "On loan",
-             loan->member_name, loan->member_id);
-}
-
-static void do_list_books(Blockchain *chain, Registry *reg) {
-    int available = 0;
-
-    printf("\n%-8s %-28s %-26s %s\n", "Book ID", "Title", "Author", "Status");
-    for (int i = 0; i < 100; i++) putchar('-');
-    putchar('\n');
-
-    for (int i = 0; i < reg->book_count; i++) {
-        Book *b = &reg->books[i];
-        char status[96];
-        describe_book_status(chain, b, status, sizeof(status));
-        if (strcmp(status, "Available") == 0) available++;
-        printf("%-8s %-28.28s %-26.26s %s\n", b->book_id, b->title, b->author, status);
-    }
-    printf("\n%d book(s) in total, %d available, %d on loan.\n",
-           reg->book_count, available, reg->book_count - available);
-}
-
-static void do_list_members(Blockchain *chain, Registry *reg) {
-    printf("\n%-9s %-26s %-8s %s\n", "Member ID", "Full Name", "Course", "Books on loan");
-    for (int i = 0; i < 100; i++) putchar('-');
-    putchar('\n');
-
-    for (int i = 0; i < reg->member_count; i++) {
-        Member *m = &reg->members[i];
-        char loans[256] = "";
-        size_t used = 0;
-
-        for (int j = 0; j < reg->book_count; j++) {
-            Block *loan = chain_find_active_loan(chain, reg->books[j].book_id);
-            if (!loan || strcmp(loan->member_id, m->member_id) != 0) continue;
-
-            Block *latest = chain_latest_for_book(chain, reg->books[j].book_id);
-            int overdue = latest && strcmp(latest->action, "OVERDUE") == 0;
-            int n = snprintf(loans + used, sizeof(loans) - used, "%s%s%s",
-                             used ? ", " : "", reg->books[j].book_id, overdue ? " (OVERDUE)" : "");
-            if (n < 0 || (size_t)n >= sizeof(loans) - used) break;
-            used += (size_t)n;
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else if ((value = flag_value(argc, argv, &i, "-m", "--model")) != NULL) {
+            if (strcasecmp(value, "utxo") == 0) opt->model = MODEL_UTXO;
+            else if (strcasecmp(value, "account") == 0) opt->model = MODEL_ACCOUNT;
+            else {
+                printf("ERROR: --model must be 'utxo' or 'account'\n");
+                return -1;
+            }
+        } else if ((value = flag_value(argc, argv, &i, "-d", "--difficulty")) != NULL) {
+            if (!parse_int(value, &n) || n < MIN_DIFFICULTY || n > MAX_DIFFICULTY) {
+                printf("ERROR: --difficulty must be a number from %d to %d\n",
+                       MIN_DIFFICULTY, MAX_DIFFICULTY);
+                return -1;
+            }
+            opt->difficulty = n;
+        } else if ((value = flag_value(argc, argv, &i, "-s", "--seed")) != NULL) {
+            if (!parse_int(value, &n) || n < 0) {
+                printf("ERROR: --seed must be a non-negative number\n");
+                return -1;
+            }
+            opt->seed = (unsigned int)n;
+            opt->seed_set = 1;
+        } else {
+            printf("ERROR: Unknown argument '%s'\n\n", argv[i]);
+            print_usage(argv[0]);
+            return -1;
         }
-
-        printf("%-9s %-26.26s %-8s %s\n", m->member_id, m->full_name, m->course_code,
-               used ? loans : "-");
     }
-    printf("\n%d member(s) in total.\n", reg->member_count);
+    return 1;
 }
 
-static void do_validate(Blockchain *chain) {
-    int bad_index = -1;
-    ChainValidationResult result = chain_validate(chain, &bad_index);
-    print_validation_result(result, bad_index, chain->count);
+/* Returns the chosen model, or -1 if input ended. */
+static int choose_model_interactively(void) {
+    printf("\nSelect the transaction model for this session:\n");
+    printf("  1. UTXO model (unspent transaction outputs, as in Bitcoin)\n");
+    printf("  2. Account-balance model (balances and nonces, as in Ethereum)\n");
+    int choice;
+    if (!prompt_int_range("Choice [1]: ", 1, 2, 1, &choice)) return -1;
+    return choice == 1 ? MODEL_UTXO : MODEL_ACCOUNT;
 }
 
-static void do_tamper(Blockchain *chain, const Session *s) {
-    if (!require_admin(s)) return;
+static void print_menu(const App *app) {
+    const char *balances = app->ledger.model == MODEL_UTXO ? "View Balances & UTXO Set"
+                                                           : "View Account Balances";
+    printf("\n===== Blockchain Library Lending Tracker =====\n");
+    printf("User: %s (%s) | Model: %s | Difficulty: %d | Chain: %d block(s) | Pending: %d\n",
+           app->session.username, auth_role_name(app->session.role),
+           ledger_model_name(app->ledger.model), app->difficulty, app->chain.count,
+           app->pending.count);
+    printf(" -- Lending --\n");
+    printf("  1. Borrow Book\n");
+    printf("  2. Return Book (creates the token reward)\n");
+    printf("  3. Mark Book Overdue\n");
+    printf("  4. List Books\n");
+    printf("  5. List Members\n");
+    printf(" -- Pending pool & mining --\n");
+    printf("  6. View Pending Pool\n");
+    printf("  7. Mine Pending Pool (solo / pool / cloud)\n");
+    printf("  8. Set Mining Difficulty [ADMIN]\n");
+    printf("  9. Difficulty Benchmark\n");
+    printf(" -- Tokens --\n");
+    printf(" 10. %s\n", balances);
+    printf(" 11. Transfer Tokens\n");
+    printf(" 12. Transaction History for an Account\n");
+    printf(" 13. Replay a Confirmed Transaction (double-spend / nonce test)\n");
+    printf(" -- Chain --\n");
+    printf(" 14. View Confirmed Lending Records\n");
+    printf(" 15. Validate Chain\n");
+    printf(" 16. Tamper With a Block (demo) [ADMIN]\n");
+    printf(" 17. Add User Account [ADMIN]\n");
+    printf("  0. Exit\n");
+}
 
-    char idx_str[16], prompt[64];
-    snprintf(prompt, sizeof(prompt), "Enter block index to tamper with (0-%d): ", chain->count - 1);
-    if (read_line(prompt, idx_str, sizeof(idx_str)) != INPUT_OK) return;
+static void do_tamper(App *app) {
+    if (!app_require_admin(app)) return;
+    if (app->chain.count < 2) {
+        printf("ERROR: Mine at least one lending block first.\n");
+        return;
+    }
 
+    printf("Tamper demo (changes are made in memory only):\n");
+    printf("  1. Change a block's action WITHOUT recomputing its hash\n");
+    printf("  2. Change a block's token reward and RE-MINE its hash (attacker with hash power)\n");
+    int mode;
+    if (!prompt_int_range("Choice: ", 1, 2, 0, &mode)) return;
+
+    char prompt[64];
+    snprintf(prompt, sizeof(prompt), "Block index to tamper with (0-%d): ", app->chain.count - 1);
     int index;
-    if (!parse_int(idx_str, &index) || index < 0 || index >= chain->count) {
-        printf("ERROR: Invalid block index\n");
-        return;
+    if (!prompt_int_range(prompt, 0, app->chain.count - 1, -1, &index)) return;
+
+    if (mode == 1) {
+        char new_action[10];
+        if (read_line("New action value to inject (e.g. RETURNED): ", new_action,
+                      sizeof(new_action)) != INPUT_OK) return;
+        chain_tamper_action(&app->chain, index, new_action);
+        printf("Block #%d's action was silently changed to '%s' (hash NOT recomputed).\n",
+               index, new_action);
+    } else {
+        int reward;
+        if (!prompt_int_range("New token reward to inject (e.g. 10): ", 0, 1000, -1, &reward)) return;
+        unsigned long long attempts = chain_tamper_reward(&app->chain, index, reward);
+        printf("Block #%d's token reward changed to %d and its hash RE-MINED after %llu attempts.\n",
+               index, reward, attempts);
+        printf("Its own hash and proof of work are valid again, but the librarian's signature,\n"
+               "its reward transaction and the next block's previous_hash no longer match.\n");
     }
-
-    char new_action[10];
-    if (read_line("Enter new action value to inject (e.g. RETURNED): ",
-                  new_action, sizeof(new_action)) != INPUT_OK) return;
-
-    chain_tamper(chain, index, new_action);
-    printf("Block #%d's action field was silently modified to '%s' (hash NOT recomputed).\n",
-           index, new_action);
-    printf("Run 'Validate Chain' to see tamper detection in action.\n");
-    printf("(The change exists only in memory. New blocks are refused while the chain is\n"
-           " invalid, so it is never saved; restart the program to reload the genuine chain.)\n");
+    printf("Run 'Validate Chain' (15) to see the tampering detected. New blocks and mining are\n"
+           "refused while the chain is invalid, so it is never saved; restart the program to\n"
+           "reload the genuine chain.\n");
 }
 
-static void do_add_user(const Session *s) {
-    if (!require_admin(s)) return;
+static void do_add_user(const App *app) {
+    if (!app_require_admin(app)) return;
 
-    char choice[8];
-    if (read_line("Role for new account (1 = LIBRARIAN, 2 = ADMIN): ",
-                  choice, sizeof(choice)) != INPUT_OK) return;
-
-    int role_num;
-    if (!parse_int(choice, &role_num) || (role_num != 1 && role_num != 2)) {
-        printf("ERROR: Invalid role\n");
-        return;
-    }
-    auth_create_user_interactive(USERS_FILE, role_num == 2 ? ROLE_ADMIN : ROLE_LIBRARIAN);
+    int role;
+    if (!prompt_int_range("Role for new account (1 = LIBRARIAN, 2 = ADMIN): ", 1, 2, 0, &role)) return;
+    auth_create_user_interactive(USERS_FILE, role == 2 ? ROLE_ADMIN : ROLE_LIBRARIAN);
 }
 
-int main(void) {
+static void do_validate(App *app) {
+    printf("Validating %d block(s) and %d ledger transaction(s)...\n", app->chain.count,
+           app->ledger.log_count);
+    app_validate(app, 1);
+}
+
+int main(int argc, char **argv) {
+    Options opt;
+    int parsed = parse_args(argc, argv, &opt);
+    if (parsed <= 0) return parsed == 0 ? 0 : 1;
+    srand(opt.seed_set ? opt.seed : (unsigned int)time(NULL));
+
+    static App app;   /* large (registry arrays): keep it off the stack */
+    memset(&app, 0, sizeof(app));
+    app.difficulty = opt.difficulty;
+
     printf("Loading registries...\n");
-    Registry reg;
-    if (!registry_load(&reg, BOOKS_FILE, MEMBERS_FILE)) {
+    if (!registry_load(&app.reg, BOOKS_FILE, MEMBERS_FILE)) {
         printf("FATAL: Could not load book/member registries. Exiting.\n");
         return 1;
     }
-    printf("Loaded %d books and %d members.\n", reg.book_count, reg.member_count);
+    printf("Loaded %d books and %d members.\n", app.reg.book_count, app.reg.member_count);
 
     if (!auth_has_users(USERS_FILE) && !auth_first_run_setup(USERS_FILE)) {
         printf("FATAL: Administrator account was not created. Exiting.\n");
         return 1;
     }
-
-    Session session;
-    if (!auth_login(USERS_FILE, &session)) {
+    if (!auth_login(USERS_FILE, &app.session)) {
         printf("FATAL: Authentication failed. Exiting.\n");
         return 1;
     }
 
-    Blockchain chain;
-    if (!chain_init(&chain) || !chain_load(&chain, CHAIN_FILE)) {
-        printf("FATAL: Could not load chain file. Exiting.\n");
-        chain_free(&chain);
-        auth_logout(&session);
+    int model = opt.model >= 0 ? opt.model : choose_model_interactively();
+    if (model < 0) {
+        auth_logout(&app.session);
+        return 1;
+    }
+    printf("Transaction model for this session: %s. Mining difficulty: %d.\n",
+           ledger_model_name((LedgerModel)model), app.difficulty);
+
+    if (!app_open(&app, (LedgerModel)model)) {
+        printf("FATAL: Could not load the chain and ledger. Exiting.\n");
+        app_close(&app);
+        auth_logout(&app.session);
+        crypto_cleanup();
         return 1;
     }
 
-    if (chain.count == 0) {
-        printf("No existing chain found. Creating genesis block...\n");
-        if (!chain_create_genesis(&chain, session.username, session.signing_key) ||
-            !chain_save(&chain, CHAIN_FILE)) {
-            printf("FATAL: Could not create genesis block. Exiting.\n");
-            chain_free(&chain);
-            auth_logout(&session);
-            return 1;
-        }
-    } else {
-        printf("Loaded existing chain with %d block(s).\n", chain.count);
-    }
-
-    printf("Verifying chain integrity on startup... ");
-    do_validate(&chain);
+    printf("Verifying chain integrity on startup...\n");
+    app_validate(&app, 1);
 
     int running = 1;
     while (running) {
-        print_menu(&session);
+        print_menu(&app);
         char choice[16];
         int rc = read_line("Choose an option: ", choice, sizeof(choice));
         if (rc == INPUT_EOF) break;
 
-        int opt = 0;
-        if (rc == INPUT_OK && !parse_int(choice, &opt)) opt = 0;
+        int opt_num = -1;
+        if (rc == INPUT_OK && !parse_int(choice, &opt_num)) opt_num = -1;
 
-        switch (opt) {
-            case 1: do_borrow(&chain, &reg, &session); break;
-            case 2: do_return(&chain, &reg, &session); break;
-            case 3: do_overdue(&chain, &reg, &session); break;
-            case 4: chain_print_records(&chain); break;
-            case 5: do_validate(&chain); break;
-            case 6: do_tamper(&chain, &session); break;
-            case 7: do_add_user(&session); break;
-            case 8: do_list_books(&chain, &reg); break;
-            case 9: do_list_members(&chain, &reg); break;
-            case 10: running = 0; break;
+        switch (opt_num) {
+            case 1: lending_borrow(&app); break;
+            case 2: lending_return(&app); break;
+            case 3: lending_overdue(&app); break;
+            case 4: lending_list_books(&app); break;
+            case 5: lending_list_members(&app); break;
+            case 6: pending_print(&app.pending, app.difficulty); break;
+            case 7: mining_menu(&app); break;
+            case 8: mining_set_difficulty(&app); break;
+            case 9: mining_benchmark(); break;
+            case 10: tokens_view_balances(&app); break;
+            case 11: tokens_transfer(&app); break;
+            case 12: tokens_history(&app); break;
+            case 13: tokens_replay_test(&app); break;
+            case 14: chain_print_records(&app.chain); break;
+            case 15: do_validate(&app); break;
+            case 16: do_tamper(&app); break;
+            case 17: do_add_user(&app); break;
+            case 0: running = 0; break;
             default: printf("Invalid option, try again.\n"); break;
         }
         if (input_eof()) break;
     }
 
     printf("Goodbye.\n");
-    chain_free(&chain);
-    auth_logout(&session);
+    app_close(&app);
+    auth_logout(&app.session);
     crypto_cleanup();
     return 0;
 }

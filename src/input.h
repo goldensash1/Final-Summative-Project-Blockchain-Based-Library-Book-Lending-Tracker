@@ -28,4 +28,16 @@ int parse_int(const char *s, int *out);
  * case-insensitive, e.g. " bk001 " -> "BK001"). */
 void to_upper_trim(char *s);
 
+/* Removes leading and trailing whitespace in place (case is kept). */
+void trim_spaces(char *s);
+
+/* Reads an ID and normalises it with to_upper_trim. Returns 0 if input was
+ * aborted (EOF or too long). */
+int prompt_id(const char *prompt, char *buf, size_t size);
+
+/* Prompts until an integer in [min, max] is entered. Empty input selects
+ * `default_value` when it is in range (pass min - 1 for "no default").
+ * Returns 1 with *out set, or 0 on EOF. */
+int prompt_int_range(const char *prompt, int min, int max, int default_value, int *out);
+
 #endif

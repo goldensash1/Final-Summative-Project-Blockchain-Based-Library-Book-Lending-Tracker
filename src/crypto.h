@@ -5,6 +5,7 @@
 #include <openssl/evp.h>
 
 #define SHA256_HEX_LEN 64   /* hex characters, plus '\0' = 65 */
+#define SHA256_DIGEST_LEN 32
 #define MAX_SIGNATURE_LEN 72
 #define KEYS_DIR "keys"
 #define KEY_NAME_MAX 32     /* also the size of Block.recorded_by */
@@ -12,6 +13,27 @@
 /* Computes the SHA-256 hash of `data` (length `len`) and writes it as a
  * lowercase hex string (65 bytes incl. terminator) into `out_hex`. */
 void sha256_hex(const unsigned char *data, size_t len, char out_hex[SHA256_HEX_LEN + 1]);
+
+/* Writes `len` bytes as lowercase hex (2*len chars + '\0') into `out`. */
+void bytes_to_hex(const unsigned char *in, size_t len, char *out);
+
+/* SHA-256 "midstate" for proof-of-work. Between mining attempts only the
+ * nonce changes, so the fixed part of the block header is absorbed once and
+ * each attempt only hashes the short nonce suffix on a copy of that state.
+ * The result is identical to SHA-256(prefix || suffix). */
+typedef struct {
+    EVP_MD_CTX *base;   /* state after absorbing the prefix */
+    EVP_MD_CTX *work;   /* scratch context reused by every attempt */
+} Sha256Prefix;
+
+/* Absorbs `prefix`. Returns 1 on success (free with sha256_prefix_free). */
+int sha256_prefix_init(Sha256Prefix *p, const unsigned char *prefix, size_t len);
+
+/* Computes the raw digest of prefix || suffix. Returns 1 on success. */
+int sha256_prefix_digest(Sha256Prefix *p, const unsigned char *suffix, size_t len,
+                         unsigned char out[SHA256_DIGEST_LEN]);
+
+void sha256_prefix_free(Sha256Prefix *p);
 
 /* Returns 1 if `name` is 3-31 chars of [A-Za-z0-9_]. Usernames double as key
  * file names, so this also guarantees they cannot escape KEYS_DIR. */

@@ -6,6 +6,194 @@
 
 #define INITIAL_CAPACITY 16
 #define MAX_CHAIN_BLOCKS 1000000   /* sanity bound when loading from disk */
+#define CONTENT_BUF 512
+#define HEADER_BUF 512
+#define NONCE_BUF 24
+
+static const char CHAIN_MAGIC[4] = {'L', 'B', 'C', '2'};
+
+static void copy_field(char *dst, size_t dst_size, const char *src) {
+    strncpy(dst, src, dst_size - 1);
+    dst[dst_size - 1] = '\0';
+}
+
+/* ======================= Hashing ======================= */
+
+/* The lending content: everything the librarian signs. */
+static int build_content(const Block *b, char *buf, size_t size) {
+    int n = snprintf(buf, size, "%ld|%s|%s|%s|%s|%s|%s|%d|%s",
+                     (long)b->timestamp, b->book_id, b->book_title,
+                     b->member_id, b->member_name, b->action, b->recorded_by,
+                     b->token_reward, b->tx_id);
+    return (n < 0 || (size_t)n >= size) ? -1 : n;
+}
+
+static int content_hash(const Block *b, char out_hex[SHA256_HEX_LEN + 1]) {
+    char buf[CONTENT_BUF];
+    int len = build_content(b, buf, sizeof(buf));
+    if (len < 0) {
+        out_hex[0] = '\0';
+        return 0;
+    }
+    sha256_hex((const unsigned char *)buf, (size_t)len, out_hex);
+    return out_hex[0] != '\0';
+}
+
+/* Everything the block hash commits to, except the nonce:
+ *   index | previous_hash | content_hash | difficulty | mined_by | signature |
+ * The nonce is appended last, so mining can reuse a SHA-256 midstate of this
+ * prefix. Returns the prefix length, or -1 for a malformed block. */
+static int build_header_prefix(const Block *b, unsigned char *buf, size_t size) {
+    char chash[SHA256_HEX_LEN + 1];
+    if (!content_hash(b, chash) || b->sig_len > MAX_SIGNATURE_LEN) return -1;
+
+    int n = snprintf((char *)buf, size, "%d|%s|%s|%d|%s|",
+                     b->index, b->previous_hash, chash, b->difficulty, b->mined_by);
+    if (n < 0 || (size_t)n + b->sig_len + 1 >= size) return -1;
+
+    memcpy(buf + n, b->signature, b->sig_len);
+    n += (int)b->sig_len;
+    buf[n++] = '|';
+    return n;
+}
+
+void block_compute_hash(const Block *b, char out_hex[SHA256_HEX_LEN + 1]) {
+    unsigned char buf[HEADER_BUF + NONCE_BUF];
+    int n = build_header_prefix(b, buf, HEADER_BUF);
+    if (n < 0) {
+        /* Malformed block (e.g. unterminated strings from a corrupted file):
+         * produce a hash that can never match a real one. */
+        out_hex[0] = '\0';
+        return;
+    }
+    n += snprintf((char *)buf + n, NONCE_BUF, "%llu", b->nonce);
+    sha256_hex(buf, (size_t)n, out_hex);
+}
+
+int block_init_signed(Block *b, const char *book_id, const char *book_title,
+                      const char *member_id, const char *member_name, const char *action,
+                      int token_reward, const char *tx_id,
+                      const char *signer, EVP_PKEY *signing_key) {
+    memset(b, 0, sizeof(Block));
+    b->index = -1;   /* assigned by the miner */
+    b->timestamp = time(NULL);
+    copy_field(b->book_id, sizeof(b->book_id), book_id);
+    copy_field(b->book_title, sizeof(b->book_title), book_title);
+    copy_field(b->member_id, sizeof(b->member_id), member_id);
+    copy_field(b->member_name, sizeof(b->member_name), member_name);
+    copy_field(b->action, sizeof(b->action), action);
+    copy_field(b->recorded_by, sizeof(b->recorded_by), signer);
+    b->token_reward = token_reward;
+    copy_field(b->tx_id, sizeof(b->tx_id), tx_id ? tx_id : ZERO_HASH);
+
+    char chash[SHA256_HEX_LEN + 1];
+    return content_hash(b, chash) &&
+           crypto_sign_hash(signing_key, chash, b->signature, &b->sig_len);
+}
+
+int block_signature_valid(const Block *b) {
+    char chash[SHA256_HEX_LEN + 1];
+    return content_hash(b, chash) &&
+           crypto_verify_hash(b->recorded_by, chash, b->signature, b->sig_len);
+}
+
+void block_sanitize(Block *b) {
+    b->book_id[sizeof(b->book_id) - 1] = '\0';
+    b->book_title[sizeof(b->book_title) - 1] = '\0';
+    b->member_id[sizeof(b->member_id) - 1] = '\0';
+    b->member_name[sizeof(b->member_name) - 1] = '\0';
+    b->action[sizeof(b->action) - 1] = '\0';
+    b->recorded_by[sizeof(b->recorded_by) - 1] = '\0';
+    b->previous_hash[sizeof(b->previous_hash) - 1] = '\0';
+    b->hash[sizeof(b->hash) - 1] = '\0';
+    b->tx_id[sizeof(b->tx_id) - 1] = '\0';
+    b->mined_by[sizeof(b->mined_by) - 1] = '\0';
+}
+
+/* ======================= Proof of work ======================= */
+
+int hash_meets_difficulty(const char *hash_hex, int difficulty) {
+    if (difficulty < MIN_DIFFICULTY || difficulty > MAX_DIFFICULTY) return 0;
+    if (strlen(hash_hex) != SHA256_HEX_LEN) return 0;
+    for (int i = 0; i < difficulty; i++) {
+        if (hash_hex[i] != '0') return 0;
+    }
+    return 1;
+}
+
+double pow_expected_attempts(int difficulty) {
+    double attempts = 1.0;
+    for (int i = 0; i < difficulty; i++) attempts *= 16.0;
+    return attempts;
+}
+
+/* Same test as hash_meets_difficulty, on the raw digest: each hex character
+ * is one 4-bit nibble. Avoids hex-encoding every failed attempt. */
+static int digest_meets_difficulty(const unsigned char *digest, int difficulty) {
+    for (int i = 0; i < difficulty; i++) {
+        unsigned char nibble = (i % 2 == 0) ? (unsigned char)(digest[i / 2] >> 4)
+                                            : (unsigned char)(digest[i / 2] & 0x0f);
+        if (nibble != 0) return 0;
+    }
+    return 1;
+}
+
+int pow_begin(PowJob *job, Block *b, int index, const char *previous_hash,
+              int difficulty, const char *miner) {
+    b->index = index;
+    copy_field(b->previous_hash, sizeof(b->previous_hash), previous_hash);
+    b->difficulty = difficulty;
+    copy_field(b->mined_by, sizeof(b->mined_by), miner);
+    b->nonce = 0;
+    b->hash[0] = '\0';
+    job->difficulty = difficulty;
+
+    unsigned char buf[HEADER_BUF];
+    int n = build_header_prefix(b, buf, sizeof(buf));
+    return n >= 0 && sha256_prefix_init(&job->sha, buf, (size_t)n);
+}
+
+int pow_try(PowJob *job, unsigned long long nonce, char out_hash[SHA256_HEX_LEN + 1]) {
+    char suffix[NONCE_BUF];
+    int n = snprintf(suffix, sizeof(suffix), "%llu", nonce);
+
+    unsigned char digest[SHA256_DIGEST_LEN];
+    if (!sha256_prefix_digest(&job->sha, (const unsigned char *)suffix, (size_t)n, digest)) {
+        return POW_ERROR;
+    }
+    if (!digest_meets_difficulty(digest, job->difficulty)) return 0;
+
+    if (out_hash) bytes_to_hex(digest, SHA256_DIGEST_LEN, out_hash);
+    return 1;
+}
+
+void pow_end(PowJob *job) {
+    sha256_prefix_free(&job->sha);
+}
+
+unsigned long long pow_mine(Block *b, int index, const char *previous_hash,
+                            int difficulty, const char *miner) {
+    PowJob job;
+    if (!pow_begin(&job, b, index, previous_hash, difficulty, miner)) return 0;
+
+    unsigned long long attempts = 0;
+    for (unsigned long long nonce = 0;; nonce++) {
+        attempts++;
+        int r = pow_try(&job, nonce, b->hash);
+        if (r == POW_ERROR) {
+            attempts = 0;
+            break;
+        }
+        if (r == 1) {
+            b->nonce = nonce;
+            break;
+        }
+    }
+    pow_end(&job);
+    return attempts;
+}
+
+/* ======================= Chain ======================= */
 
 int chain_init(Blockchain *chain) {
     chain->blocks = malloc(sizeof(Block) * INITIAL_CAPACITY);
@@ -38,151 +226,64 @@ static int chain_reserve(Blockchain *chain, int needed) {
     return 1;
 }
 
-/* Builds the canonical byte buffer used both for the "data hash" (the part
- * that gets signed) and, together with the signature, for the block's final
- * hash. When include_signature is 0 the signature bytes are left out, which
- * is exactly the pre-signature "data to sign" view of the block. */
-static int build_hash_buffer(const Block *b, int include_signature,
-                             unsigned char *buf, size_t buf_size) {
-    int n = snprintf((char *)buf, buf_size,
-                     "%d|%ld|%s|%s|%s|%s|%s|%s|%s",
-                     b->index, (long)b->timestamp,
-                     b->book_id, b->book_title,
-                     b->member_id, b->member_name,
-                     b->action, b->recorded_by, b->previous_hash);
-    if (n < 0 || (size_t)n >= buf_size) return -1;
-
-    if (include_signature && b->sig_len > 0) {
-        size_t remaining = buf_size - (size_t)n;
-        if (b->sig_len > MAX_SIGNATURE_LEN || b->sig_len > remaining) return -1;
-        memcpy(buf + n, b->signature, b->sig_len);
-        n += (int)b->sig_len;
-    }
-    return n;
+const char *chain_tip_hash(const Blockchain *chain) {
+    return chain->count > 0 ? chain->blocks[chain->count - 1].hash : ZERO_HASH;
 }
 
-static void compute_hash(const Block *b, int include_signature, char out_hex[65]) {
-    unsigned char buf[512];
-    int len = build_hash_buffer(b, include_signature, buf, sizeof(buf));
-    if (len < 0) {
-        /* Malformed block (e.g. unterminated strings from a corrupted file):
-         * produce a hash that can never match a real one. */
-        out_hex[0] = '\0';
-        return;
-    }
-    sha256_hex(buf, (size_t)len, out_hex);
-}
-
-/* Fills in previous_hash, signature and hash for a block whose data fields
- * are already set. */
-static int seal_block(Block *b, const char *previous_hash, EVP_PKEY *signing_key) {
-    strcpy(b->previous_hash, previous_hash);
-
-    char data_hash[65];
-    compute_hash(b, 0, data_hash);
-    if (data_hash[0] == '\0' ||
-        !crypto_sign_hash(signing_key, data_hash, b->signature, &b->sig_len)) {
+int chain_append(Blockchain *chain, const Block *b) {
+    if (b->index != chain->count || strcmp(b->previous_hash, chain_tip_hash(chain)) != 0) {
+        printf("ERROR: Block does not extend the current chain tip\n");
         return 0;
     }
 
-    compute_hash(b, 1, b->hash);
-    return b->hash[0] != '\0';
-}
+    char recomputed[SHA256_HEX_LEN + 1];
+    block_compute_hash(b, recomputed);
+    if (recomputed[0] == '\0' || strcmp(recomputed, b->hash) != 0 ||
+        !hash_meets_difficulty(b->hash, b->difficulty)) {
+        printf("ERROR: Block hash is wrong or does not meet its proof-of-work target\n");
+        return 0;
+    }
 
-static void copy_field(char *dst, size_t dst_size, const char *src) {
-    strncpy(dst, src, dst_size - 1);
-    dst[dst_size - 1] = '\0';
-}
-
-int chain_create_genesis(Blockchain *chain, const char *signer, EVP_PKEY *signing_key) {
-    if (chain->count != 0 || !chain_reserve(chain, 1)) return 0;
-
-    Block *b = &chain->blocks[0];
-    memset(b, 0, sizeof(Block));
-    b->index = 0;
-    b->timestamp = time(NULL);
-    copy_field(b->book_id, sizeof(b->book_id), "N/A");
-    copy_field(b->book_title, sizeof(b->book_title), "GENESIS BLOCK");
-    copy_field(b->member_id, sizeof(b->member_id), "N/A");
-    copy_field(b->member_name, sizeof(b->member_name), "SYSTEM");
-    copy_field(b->action, sizeof(b->action), "GENESIS");
-    copy_field(b->recorded_by, sizeof(b->recorded_by), signer);
-
-    if (!seal_block(b, GENESIS_HASH, signing_key)) return 0;
-    chain->count = 1;
-    return 1;
-}
-
-int chain_add_block(Blockchain *chain, const char *book_id, const char *book_title,
-                    const char *member_id, const char *member_name, const char *action,
-                    const char *signer, EVP_PKEY *signing_key) {
-    if (chain->count == 0) return 0; /* genesis must exist first */
     if (!chain_reserve(chain, chain->count + 1)) return 0;
-
-    Block *b = &chain->blocks[chain->count];
-    memset(b, 0, sizeof(Block));
-    b->index = chain->count;
-    b->timestamp = time(NULL);
-    copy_field(b->book_id, sizeof(b->book_id), book_id);
-    copy_field(b->book_title, sizeof(b->book_title), book_title);
-    copy_field(b->member_id, sizeof(b->member_id), member_id);
-    copy_field(b->member_name, sizeof(b->member_name), member_name);
-    copy_field(b->action, sizeof(b->action), action);
-    copy_field(b->recorded_by, sizeof(b->recorded_by), signer);
-
-    if (!seal_block(b, chain->blocks[chain->count - 1].hash, signing_key)) return 0;
-    chain->count++;
+    chain->blocks[chain->count++] = *b;
     return 1;
 }
 
-Block *chain_find_active_loan(Blockchain *chain, const char *book_id) {
-    for (int i = chain->count - 1; i >= 0; i--) {
-        Block *b = &chain->blocks[i];
-        if (strcmp(b->book_id, book_id) != 0) continue;
-        if (strcmp(b->action, "BORROWED") == 0) return b;
-        if (strcmp(b->action, "RETURNED") == 0) return NULL;
-        /* OVERDUE: loan is still open, keep looking for its BORROWED block */
-    }
-    return NULL;
+void chain_pop(Blockchain *chain) {
+    if (chain->count > 0) chain->count--;
 }
 
-Block *chain_latest_for_book(Blockchain *chain, const char *book_id) {
-    for (int i = chain->count - 1; i >= 0; i--) {
-        if (strcmp(chain->blocks[i].book_id, book_id) == 0) return &chain->blocks[i];
-    }
-    return NULL;
-}
+ChainValidationResult chain_check_block(const Blockchain *chain, int i) {
+    const Block *b = &chain->blocks[i];
 
-static int signature_valid(const Block *b) {
-    char data_hash[65];
-    compute_hash(b, 0, data_hash);
-    return data_hash[0] != '\0' &&
-           crypto_verify_hash(b->recorded_by, data_hash, b->signature, b->sig_len);
-}
+    char recomputed[SHA256_HEX_LEN + 1];
+    block_compute_hash(b, recomputed);
+    if (recomputed[0] == '\0' || strcmp(recomputed, b->hash) != 0) return CHAIN_BAD_HASH;
 
-ChainValidationResult chain_validate(Blockchain *chain, int *bad_index) {
-    for (int i = 0; i < chain->count; i++) {
-        Block *b = &chain->blocks[i];
+    const char *expected_prev = (i == 0) ? ZERO_HASH : chain->blocks[i - 1].hash;
+    if (b->index != i || strcmp(b->previous_hash, expected_prev) != 0) return CHAIN_BROKEN_LINK;
 
-        char recomputed[65];
-        compute_hash(b, 1, recomputed);
-        if (recomputed[0] == '\0' || strcmp(recomputed, b->hash) != 0) {
-            if (bad_index) *bad_index = i;
-            return CHAIN_BAD_HASH;
-        }
+    if (!block_signature_valid(b)) return CHAIN_BAD_SIGNATURE;
 
-        const char *expected_prev = (i == 0) ? GENESIS_HASH : chain->blocks[i - 1].hash;
-        if (b->index != i || strcmp(b->previous_hash, expected_prev) != 0) {
-            if (bad_index) *bad_index = i;
-            return CHAIN_BROKEN_LINK;
-        }
+    if (!hash_meets_difficulty(b->hash, b->difficulty)) return CHAIN_BAD_POW;
 
-        if (!signature_valid(b)) {
-            if (bad_index) *bad_index = i;
-            return CHAIN_BAD_SIGNATURE;
-        }
-    }
     return CHAIN_VALID;
+}
+
+const char *chain_result_message(ChainValidationResult result) {
+    switch (result) {
+        case CHAIN_VALID:
+            return "valid";
+        case CHAIN_BAD_HASH:
+            return "stored hash does not match its recomputed hash (data was changed after mining)";
+        case CHAIN_BROKEN_LINK:
+            return "previous_hash does not match the preceding block's hash (chain link broken)";
+        case CHAIN_BAD_SIGNATURE:
+            return "librarian's digital signature does not verify (content changed after signing)";
+        case CHAIN_BAD_POW:
+            return "hash does not meet its proof-of-work difficulty target";
+    }
+    return "unknown error";
 }
 
 static void format_timestamp(time_t t, char *buf, size_t size) {
@@ -192,105 +293,77 @@ static void format_timestamp(time_t t, char *buf, size_t size) {
     }
 }
 
-void chain_print_records(Blockchain *chain) {
+void chain_print_records(const Blockchain *chain) {
     if (chain->count == 0) {
         printf("(no blocks in chain)\n");
         return;
     }
 
-    printf("\n%-5s %-6s %-20s %-7s %-16s %-9s %-12s %-8s %-19s %s\n",
-           "Index", "Book", "Book Title", "Member", "Member Name", "Action",
-           "Signed By", "SigValid", "Timestamp", "Hash(8)");
-    for (int i = 0; i < 118; i++) putchar('-');
+    printf("\nConfirmed lending records (%d block(s)):\n", chain->count);
+    printf("%-4s %-22s %-16s %-9s %-6s %-9s %-7s %-19s %-12s %-2s %-8s %s\n",
+           "Idx", "Book Title", "Member Name", "Action", "Reward", "Tx ID", "SigOK",
+           "Timestamp", "Mined By", "D", "Nonce", "Hash");
+    for (int i = 0; i < 136; i++) putchar('-');
     putchar('\n');
 
     for (int i = 0; i < chain->count; i++) {
-        Block *b = &chain->blocks[i];
+        const Block *b = &chain->blocks[i];
         char ts[32];
         format_timestamp(b->timestamp, ts, sizeof(ts));
+        int has_tx = strcmp(b->tx_id, ZERO_HASH) != 0;
 
-        printf("%-5d %-6.6s %-20.20s %-7.7s %-16.16s %-9.9s %-12.12s %-8s %-19s %.8s\n",
-               b->index, b->book_id, b->book_title, b->member_id, b->member_name,
-               b->action, b->recorded_by, signature_valid(b) ? "VALID" : "INVALID",
-               ts, b->hash);
+        printf("%-4d %-22.22s %-16.16s %-9.9s %-6d %-9.8s %-7s %-19s %-12.12s %-2d %-8llu %.16s...\n",
+               b->index, b->book_title, b->member_name, b->action, b->token_reward,
+               has_tx ? b->tx_id : "-", block_signature_valid(b) ? "VALID" : "INVALID",
+               ts, b->mined_by, b->difficulty, b->nonce, b->hash);
     }
     printf("\n");
 }
 
-int chain_save(Blockchain *chain, const char *path) {
-    char tmp_path[512];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
-
-    FILE *fp = fopen(tmp_path, "wb");
-    if (!fp) {
-        printf("ERROR: Could not open '%s' for writing\n", tmp_path);
-        return 0;
-    }
-
-    int ok = fwrite(&chain->count, sizeof(int), 1, fp) == 1 &&
-             fwrite(chain->blocks, sizeof(Block), (size_t)chain->count, fp) == (size_t)chain->count;
-    if (fclose(fp) != 0) ok = 0;
-
-    if (!ok || rename(tmp_path, path) != 0) {
-        printf("ERROR: Failed to save chain to '%s'\n", path);
-        remove(tmp_path);
-        return 0;
-    }
-    return 1;
+int chain_save(const Blockchain *chain, const char *path) {
+    return storage_save(path, CHAIN_MAGIC, chain->blocks, sizeof(Block), chain->count);
 }
 
-int chain_load(Blockchain *chain, const char *path) {
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return 1; /* no file yet: caller creates genesis */
-
+StorageResult chain_load(Blockchain *chain, const char *path) {
+    void *records = NULL;
     int count = 0;
-    if (fread(&count, sizeof(int), 1, fp) != 1) {
-        fclose(fp);
-        printf("ERROR: Chain file '%s' is empty or unreadable\n", path);
-        return 0;
+    StorageResult rc = storage_load(path, CHAIN_MAGIC, sizeof(Block), MAX_CHAIN_BLOCKS,
+                                    &records, &count);
+    if (rc != STORAGE_OK) return rc;
+
+    if (count < 1) {
+        free(records);
+        printf("ERROR: Chain file '%s' holds no blocks (not even genesis)\n", path);
+        return STORAGE_ERROR;
     }
 
-    if (count < 1 || count > MAX_CHAIN_BLOCKS) {
-        fclose(fp);
-        printf("ERROR: Chain file '%s' has an invalid block count (%d)\n", path, count);
-        return 0;
-    }
-
-    if (!chain_reserve(chain, count)) {
-        fclose(fp);
-        return 0;
-    }
-
-    size_t read = fread(chain->blocks, sizeof(Block), (size_t)count, fp);
-    fclose(fp);
-
-    if ((int)read != count) {
-        printf("ERROR: Chain file '%s' appears truncated or corrupted\n", path);
-        chain->count = 0;
-        return 0;
-    }
-
-    /* Force-terminate every string so a corrupted file can't cause reads
-     * past the end of a field; any real change still fails validation. */
-    for (int i = 0; i < count; i++) {
-        Block *b = &chain->blocks[i];
-        b->book_id[sizeof(b->book_id) - 1] = '\0';
-        b->book_title[sizeof(b->book_title) - 1] = '\0';
-        b->member_id[sizeof(b->member_id) - 1] = '\0';
-        b->member_name[sizeof(b->member_name) - 1] = '\0';
-        b->action[sizeof(b->action) - 1] = '\0';
-        b->recorded_by[sizeof(b->recorded_by) - 1] = '\0';
-        b->previous_hash[sizeof(b->previous_hash) - 1] = '\0';
-        b->hash[sizeof(b->hash) - 1] = '\0';
-    }
-
+    free(chain->blocks);
+    chain->blocks = records;
     chain->count = count;
-    return 1;
+    chain->capacity = count;
+
+    /* Any real change still fails validation; this only stops reads past
+     * the end of a field. */
+    for (int i = 0; i < count; i++) block_sanitize(&chain->blocks[i]);
+    return STORAGE_OK;
 }
 
-int chain_tamper(Blockchain *chain, int index, const char *new_action) {
+int chain_tamper_action(Blockchain *chain, int index, const char *new_action) {
     if (index < 0 || index >= chain->count) return 0;
     copy_field(chain->blocks[index].action, sizeof(chain->blocks[index].action), new_action);
     /* Deliberately NOT recomputing the hash -- this is the tamper demo. */
     return 1;
+}
+
+unsigned long long chain_tamper_reward(Blockchain *chain, int index, int new_reward) {
+    if (index < 0 || index >= chain->count) return 0;
+    Block *b = &chain->blocks[index];
+    b->token_reward = new_reward;
+
+    /* Re-mine at the same position, so the block's own hash and PoW are
+     * valid again. Copies avoid passing a field as both source and target. */
+    char prev[sizeof(b->previous_hash)], miner[sizeof(b->mined_by)];
+    copy_field(prev, sizeof(prev), b->previous_hash);
+    copy_field(miner, sizeof(miner), b->mined_by);
+    return pow_mine(b, b->index, prev, b->difficulty, miner);
 }

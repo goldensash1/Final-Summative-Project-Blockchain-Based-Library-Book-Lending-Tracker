@@ -40,10 +40,44 @@ void sha256_hex(const unsigned char *data, size_t len, char out_hex[SHA256_HEX_L
     }
     EVP_MD_CTX_free(ctx);
 
-    for (unsigned int i = 0; i < digest_len; i++) {
-        sprintf(out_hex + (i * 2), "%02x", digest[i]);
+    bytes_to_hex(digest, digest_len, out_hex);
+}
+
+void bytes_to_hex(const unsigned char *in, size_t len, char *out) {
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        out[i * 2] = digits[in[i] >> 4];
+        out[i * 2 + 1] = digits[in[i] & 0x0f];
     }
-    out_hex[digest_len * 2] = '\0';
+    out[len * 2] = '\0';
+}
+
+int sha256_prefix_init(Sha256Prefix *p, const unsigned char *prefix, size_t len) {
+    p->base = EVP_MD_CTX_new();
+    p->work = EVP_MD_CTX_new();
+    if (!p->base || !p->work ||
+        EVP_DigestInit_ex(p->base, EVP_sha256(), NULL) != 1 ||
+        EVP_DigestUpdate(p->base, prefix, len) != 1) {
+        sha256_prefix_free(p);
+        return 0;
+    }
+    return 1;
+}
+
+int sha256_prefix_digest(Sha256Prefix *p, const unsigned char *suffix, size_t len,
+                         unsigned char out[SHA256_DIGEST_LEN]) {
+    unsigned int out_len = 0;
+    return EVP_MD_CTX_copy_ex(p->work, p->base) == 1 &&
+           EVP_DigestUpdate(p->work, suffix, len) == 1 &&
+           EVP_DigestFinal_ex(p->work, out, &out_len) == 1 &&
+           out_len == SHA256_DIGEST_LEN;
+}
+
+void sha256_prefix_free(Sha256Prefix *p) {
+    EVP_MD_CTX_free(p->base);
+    EVP_MD_CTX_free(p->work);
+    p->base = NULL;
+    p->work = NULL;
 }
 
 int crypto_valid_key_name(const char *name) {

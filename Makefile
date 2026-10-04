@@ -1,10 +1,12 @@
 CC = gcc
+
+# Optional run-time arguments, e.g. make run ARGS="--model account --difficulty 3"
+ARGS ?=
 CFLAGS = -Wall -Wextra -std=c11 -D_POSIX_C_SOURCE=200809L
 SRC_DIR = src
 TARGET = library_tracker
 
-SRCS = $(SRC_DIR)/main.c $(SRC_DIR)/blockchain.c $(SRC_DIR)/registry.c \
-       $(SRC_DIR)/crypto.c $(SRC_DIR)/auth.c $(SRC_DIR)/input.c
+SRCS = $(wildcard $(SRC_DIR)/*.c)
 HDRS = $(wildcard $(SRC_DIR)/*.h)
 
 # Homebrew OpenSSL on macOS is keg-only, so point at it explicitly if present.
@@ -44,15 +46,33 @@ $(TARGET): $(SRCS) $(HDRS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(SRCS) $(LDFLAGS) $(LDLIBS)
 
 run: $(TARGET)
-	./$(TARGET)
+	./$(TARGET) $(ARGS)
 
-# Removes the binary and the ledger (keeps user accounts and keys).
+# Shortcuts for the two transaction models.
+run-utxo: $(TARGET)
+	./$(TARGET) --model utxo $(ARGS)
+
+run-account: $(TARGET)
+	./$(TARGET) --model account $(ARGS)
+
+# Automated end-to-end tests (run in a temporary folder; your data is untouched).
+test: $(TARGET)
+	bash tests/run_tests.sh
+
+# Submission archive: source, docs, tests, registries (no binary, data or keys).
+DIST = Formative2_Golden_Munyankindi.zip
+dist:
+	rm -f $(DIST)
+	zip -r $(DIST) Makefile README.md books.txt members.txt .gitignore src tests docs -x '*.DS_Store'
+
+# Removes the binary, the chain, the pending pool and the token ledger
+# (keeps user accounts and keys).
 clean:
-	rm -f $(TARGET) chain.dat chain.dat.tmp
+	rm -f $(TARGET) chain.dat chain.dat.tmp pending.dat pending.dat.tmp ledger.dat ledger.dat.tmp
 
 # Full reset: also deletes all user accounts and their key pairs.
 distclean: clean
 	rm -f users.dat
 	rm -rf keys
 
-.PHONY: all run clean distclean
+.PHONY: all run run-utxo run-account test dist clean distclean

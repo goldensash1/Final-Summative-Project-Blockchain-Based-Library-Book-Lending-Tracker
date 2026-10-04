@@ -1,6 +1,16 @@
 library_tracker
 chain.dat
 chain.dat.tmp
+pending.dat
+pending.dat.tmp
 users.dat
 keys/
 *.o
+ledger.dat
+ledger.dat.tmp
+Formative2_*.zip
+
+# Personal notes, not part of the submission
+docs/demo_video_script.md
+docs/viva_questions.md
+docs/submission_checklist.md
