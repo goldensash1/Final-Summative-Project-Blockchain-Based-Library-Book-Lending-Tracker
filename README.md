@@ -1,220 +1,161 @@
-# Blockchain-Based Library Book Lending Tracker: Formative 2
+# Blockchain-Based Library Book Lending Tracker: Summative
 
-This project extends the Formative 1 lending tracker. Each borrow, return, overdue mark and token transfer still
-creates a signed block, but now:
+A command-line program in C that keeps an ALU library's lending records on a small proof-of-work
+blockchain. It combines Formative 1 (signed lending records, book and member registries, SHA-256 hash
+chain, validation) and Formative 2 (token rewards for returns, a pending pool, mining, UTXO and account
+models, solo/pool/cloud mining), and adds the summative features:
 
-- **Returning a book creates a token reward transaction automatically.** An on-time return earns 10 coins and a
-  late return earns 5. A book that is overdue and not returned creates no transaction. A fixed fee of 1 coin
-  is taken from every reward and transfer and goes to the miner.
-- **Blocks wait in a pending pool.** They are added to the chain only after a miner confirms them with
-  proof of work. Balances change only at that point.
-- **Balances use one of two transaction models,** chosen for the whole session: the **UTXO** model
-  (like Bitcoin) or the **account-based** model (like Ethereum).
-- **There are three ways to mine:** solo, pool (with a 2% pool fee and rewards shared by hash attempts) and
-  cloud (rented hash power for 1 to 5 rounds, with rental and maintenance fees).
-
-Everything from Formative 1 is still there: the book and member registries, login with PBKDF2 password
-hashing, per-user ECDSA P-256 signing keys, chain validation and the tamper demo.
-
-## How it works
-
-**From a lending event to a token transaction.** Each lending action creates a block signed by the
-logged-in librarian. A return also creates a reward transaction straight away: the `LIBRARY` treasury
-pays 10 coins (on time) or 5 coins (late), the member receives the reward minus the 1-coin fee, and the
-fee goes to the miner. The transaction ID is the SHA-256 hash of the transaction. It is stored in the
-block's `tx_id` field and covered by the librarian's signature, so the block and its transaction can't be
-separated or changed. Borrows and overdue marks create no transaction (token reward 0).
-
-**How mining confirms blocks.** New blocks go into the pending pool (`pending.dat`) without an index,
-a previous hash or a nonce. A miner takes them oldest first and, for each one:
-
-1. checks the librarian's signature and that the transaction matches the block;
-2. places the block after the current chain tip;
-3. increases the nonce until the SHA-256 hash starts with `difficulty` zeros;
-4. appends the block and confirms its transaction in the ledger.
-
-Only at step 4 does the member's balance change. The miner is then paid 50 coins per block plus the
-fees.
-
-**UTXO model.** Balances are the sum of the unspent outputs a member owns. A transaction spends whole
-outputs as inputs, pays the recipient (output 0) and returns any extra to the sender as change
-(output 1). The fee is the inputs minus the outputs. Inputs are locked while the transaction is pending
-and removed once it is confirmed, so spending them again is rejected as a double spend.
-
-**Account model.** Each account stores a balance, a nonce and a linked-list history. A transaction must
-use exactly the sender's next nonce, and the sender needs enough balance for the amount plus the fee
-(minus whatever is already reserved by pending transactions). A reused or skipped nonce, or an
-insufficient balance, is rejected.
-
-**One ledger, two views.** All confirmed transactions are kept in order in `ledger.dat` and replayed
-into the chosen model at startup, so both models always show the same balances.
+- **Multi-record blocks with a Merkle root.** A block holds up to 3 lending records (configurable 1-8).
+  The Merkle tree is built from scratch and checked on every validation.
+- **Copy-level inventory** loaded from `copies.txt`, with an availability state machine
+  (AVAILABLE, BORROWED, RESERVED, LOST).
+- **Reservations, renewals, overdue detection and fines.** Each title has a FIFO reservation queue, and a
+  returned copy is offered to the first member in the queue. Renewals add 7 days (at most 2 per loan).
+  Overdue copies are flagged automatically and fined 1 coin per day.
+- **Real ECDSA signatures for every member.** Each member has their own P-256 key pair and signs their own
+  requests. The public key is stored in every record as the signer's on-chain identity.
+- **Nonce replay protection.** Every signer has a request counter. A request with any nonce other than the
+  next one is rejected.
+- **Prioritised pending pool.** Overdue-related requests come first, then whoever has waited longest.
+- **Fraud detection** with a manual review workflow (`fraud_review`, `approve_suspicious`, `reject_suspicious`).
+- **Disk persistence** of the chain, pool, ledger, inventory, queues, nonces, fines, balances and
+  settings. A saved chain must pass `validate_chain` before any other operation is allowed.
+- **A named-command CLI** (`borrow_book`, `mine_solo`, `validate_chain`, ...).
 
 ## Dependencies
 
 - A C compiler (`gcc` or `clang`) and `make`
-- **OpenSSL 3.x** (headers and libcrypto/libssl). It provides SHA-256, ECDSA, PBKDF2, AES key encryption
+- **OpenSSL 3.x** (headers and libcrypto). It provides SHA-256, ECDSA (P-256), PBKDF2, AES key encryption
   and secure random numbers.
   - macOS: `brew install openssl@3`
   - Debian/Ubuntu: `sudo apt-get install build-essential libssl-dev`
+- `python3` is only used by `make test` (to edit a file for the tamper test).
 
-No other libraries are needed.
-
-### Apple Silicon note
-
-The `Makefile` looks for OpenSSL in `/opt/homebrew/opt/openssl@3` and `/usr/local/opt/openssl@3`. You can
-override this with `make OPENSSL_PREFIX=/path/to/openssl`. If the only OpenSSL it finds is an Intel
-(x86_64) build, it builds an x86_64 binary that runs under Rosetta 2. Install Rosetta once with
-`softwareupdate --install-rosetta --agree-to-license`.
+The `Makefile` looks for OpenSSL in `/opt/homebrew/opt/openssl@3` and `/usr/local/opt/openssl@3`; override
+with `make OPENSSL_PREFIX=/path/to/openssl`. If the only OpenSSL found is an Intel build on an Apple
+Silicon Mac, it builds an x86_64 binary that runs under Rosetta 2.
 
 ## Compile
 
 ```bash
-make            # builds ./library_tracker from every file in src/
-make test       # runs the automated end-to-end tests (51 checks, in a temporary folder)
-make dist       # creates Formative2_Golden_Munyankindi.zip for submission
-make clean      # removes the binary, chain.dat, pending.dat and ledger.dat (keeps accounts and keys)
+make            # builds ./library_tracker from every file in src/ with -Wall -Wextra
+make test       # 76 automated end-to-end checks in a temporary folder
+make clean      # removes the binary and all saved chain state (keeps accounts and keys)
 make distclean  # full reset: also removes users.dat and keys/
+make dist       # creates Summative_Golden_Munyankindi.zip
 ```
 
-`make test` runs the real program through every scenario in the brief: rewards, the pending pool, all
-three mining methods, both models, double spends, nonces, the difficulty setting and tampering. It works
-in a temporary folder, so your own accounts and chain are never touched. It should end with
-`Result: 51 passed, 0 failed`.
-
-To compile by hand (macOS example):
+By hand (macOS example):
 
 ```bash
-gcc -Wall -Wextra -std=c11 -D_POSIX_C_SOURCE=200809L \
-    -I$(brew --prefix openssl@3)/include -o library_tracker src/*.c \
-    -L$(brew --prefix openssl@3)/lib -lssl -lcrypto
+gcc -Wall -Wextra -std=c11 -D_POSIX_C_SOURCE=200809L -I$(brew --prefix openssl@3)/include \
+    -o library_tracker src/*.c -L$(brew --prefix openssl@3)/lib -lssl -lcrypto
 ```
 
-The code compiles with no warnings under `-Wall -Wextra`. Run the program from the project folder so it can
-find `books.txt` and `members.txt`.
+The code compiles with no warnings. Run the program from the project folder so it finds `books.txt`,
+`members.txt` and `copies.txt`. Chain files from Formative 1 or 2 have a different format and are refused:
+run `make clean` first.
 
-> Chain files from Formative 1 have a different block layout. The program detects this and asks you to run
-> `make clean` first.
-
-## Run, switch transaction model and set the difficulty
+## Run
 
 ```
-./library_tracker [--model utxo|account] [--difficulty 1-4] [--seed N] [--help]
+./library_tracker [--model utxo|account] [--difficulty 1-4] [--batch 1-8] [--seed N]
 ```
 
-| Option | Meaning |
+On the first run you create the admin account. The program then generates a key pair for every member
+and mines the genesis block, which funds the `LIBRARY` reward treasury with 10,000 coins. Commands are
+typed one per line. Type `help` for the full list. Missing arguments are asked for, and names with spaces
+go in quotes: `register_member ALU006 "Jane Doe" BLK103`.
+
+### Switching between the UTXO and account-based models
+
+The model is chosen for the whole session with `--model utxo` or `--model account` (or from a menu at
+startup if the option is left out). To switch, type `exit` and start again with the other option. Both
+models are rebuilt from the same confirmed transaction log (`ledger.dat`), so the balances are the same in
+both; only how they are stored and checked changes. `make run-utxo` and `make run-account` are shortcuts.
+
+### Setting the mining difficulty
+
+- At startup: `--difficulty N` with N from 1 to 4 (hash must start with N zeros). Other values are refused.
+- During a session (ADMIN): `set_difficulty N`. `difficulty_status` shows the target and expected attempts.
+- The difficulty is saved in `meta.dat`. Each block stores the difficulty it was mined at, so old blocks
+  still validate after a change.
+
+### How to test the mining simulations
+
+1. Create some pending requests, for example `borrow_book ALU001 BK001`, `borrow_book ALU002 BK002`,
+   `borrow_book ALU003 BK004`, `borrow_book ALU004 BK005`. `pool_view` shows them in priority order.
+2. **Solo:** `mine_solo`. For each block it prints the records, the nonce, the number of hash attempts, the
+   hash and the UTXO set (or updated accounts). The miner gets 50 coins per block plus fees.
+3. **Pool:** `mine_pool 4`. Four miners get random hash rates. The table shows miner ID, attempts, share
+   and reward after the 2% pool fee. Reward share = miner_attempts / total_attempts x (block rewards + fees - pool fee).
+4. **Cloud:** `mine_cloud 3` rents 400 attempts per round for 3 rounds at 20 coins per round. The summary
+   shows gross earnings, fees and net profit. A warning is printed in any round where the total fees are
+   higher than the total rewards (try `mine_cloud 5` with only one pending request).
+5. **Difficulty:** `benchmark` mines sample blocks at difficulties 1-4 (expect about 16, 256, 4096 and 65536
+   attempts). Then `set_difficulty 4` and `mine_solo` to see a hash starting with `0000`.
+
+To see overdue detection without waiting two weeks, use `advance_days 20` (ADMIN). It moves the library's
+simulated clock forward, and the overdue scan then flags every copy past its due date.
+
+## Commands
+
+| Group | Commands |
 |---|---|
-| `-m`, `--model utxo` or `account` | Transaction model for the whole session. If you leave it out, a menu asks at startup. |
-| `-d`, `--difficulty 1-4` | Proof-of-work difficulty, which is the number of leading zero hex digits the block hash needs. The default is **2**. Values outside 1 to 4 are rejected. |
-| `-s`, `--seed N` | Seed for the random hash rates of the pool miners, so a pool run can be repeated. |
+| Membership | `register_member <id> "<name>" <course>`, `view_member <id>`, `member_nonce <id>`, `list_members` |
+| Books and copies | `register_book <id> "<title>" "<author>" [copies=N]`, `view_book <id>`, `add_copy <book_id> [NEW\|GOOD\|WORN]`, `view_copy <copy_id>`, `mark_lost <copy_id> <reason_code>`, `list_books` |
+| Lending | `borrow_book <member_id> <book_id\|copy_id> [due=YYYY-MM-DD] [nonce=N]`, `return_book <copy_id> [condition] [reason=CODE]`, `renew_book <copy_id>`, `reserve_book <member_id> <book_id>`, `reservation_status [book_id]` |
+| Fines and overdue | `check_overdue`, `view_fines [member_id]`, `settle_fine <member_id> [amount] [method=tokens\|cash]`, `advance_days <n>` |
+| Tokens and ledger | `token_transfer <from> <to> <amount>`, `token_balance [id]`, `utxo_view [owner]`, `account_balance [id]`, `account_transfer <from> <to> <amount> [nonce]`, `account_nonce <id>`, `transaction_history <member_id>`, `replay_tx <txid-prefix>` |
+| Chain and mining | `pool_view`, `mine_solo`, `mine_pool [miners]`, `mine_cloud <rounds>`, `chain_view [index]`, `validate_chain`, `chain_save`, `chain_load`, `difficulty_status`, `set_difficulty <1-4>`, `benchmark` |
+| Fraud and audit | `fraud_review`, `approve_suspicious <id>`, `reject_suspicious <id>`, `replay_request <id>`, `lending_history`, `member_history <id>`, `book_history <book_id\|copy_id>`, `tamper_block <index> <record\|header\|remine>` |
+| Session | `add_user`, `help`, `exit` |
 
-Make shortcuts:
+## Library rules (configurable in `src/state.h` and `src/app.h`)
 
-```bash
-make run                                   # asks for the model at startup
-make run-utxo                              # --model utxo
-make run-account ARGS="--difficulty 3"     # --model account --difficulty 3
-```
+| Rule | Value |
+|---|---|
+| Loan period / renewal | 14 days / +7 days, at most 2 renewals; not allowed if another member reserved the title or the copy is overdue |
+| Fine | 1 coin per day overdue, charged when the late return is mined; 20 coins for a borrowed copy marked LOST |
+| Token reward | 10 coins on time, 5 late (minus the 1-coin fee, which goes to the miner); none while a book stays overdue |
+| Block reward | 50 coins per block plus fees |
+| Fraud limits | more than 3 copies at once; re-borrowing a title within 24 hours of returning it; a duplicate request_id; a return that lowers the condition by more than one level without a reason code |
 
-**Switching models:** quit the program and start it again with the other `--model`. Both models are built
-from the same confirmed transaction log (`ledger.dat`), so balances are identical in both. Only the way
-they are stored and checked changes.
+## Files
 
-**Changing the difficulty during a session:** menu option **8** (ADMIN only) accepts a value from 1 to 4.
-Each block stores the difficulty it was mined at, so older blocks still validate.
+| File | Contents |
+|---|---|
+| `books.txt`, `members.txt` | registries (`id,title,author` and `id,full_name,course_code`) |
+| `copies.txt` | `copy_id,book_id,condition[,added_at_block]` |
+| `chain.dat` | every block with its records (binary) |
+| `pending.dat` | the pending pool |
+| `ledger.dat` | every confirmed token transaction |
+| `library_state.dat` | copy inventory, reservation queues, request nonces, fines |
+| `balances.dat`, `utxo.dat` | balances and account nonces; the UTXO set |
+| `meta.dat` | difficulty, block reward, batch size, simulated clock, next request ID, chain tip |
+| `users.dat`, `keys/` | librarian accounts (PBKDF2), librarian and member ECDSA keys |
 
-On the first run you create the admin account and log in. The program then mines the genesis block, which
-also funds the `LIBRARY` reward treasury with 10,000 coins.
-
-## Menu
-
-```
- -- Lending --                            -- Tokens --
-  1. Borrow Book                          10. View Balances & UTXO Set / Account Balances
-  2. Return Book (creates the reward)     11. Transfer Tokens
-  3. Mark Book Overdue                    12. Transaction History for an Account
-  4. List Books                           13. Replay a Confirmed Transaction (double-spend / nonce test)
-  5. List Members (with balances)        -- Chain --
- -- Pending pool & mining --              14. View Confirmed Lending Records
-  6. View Pending Pool                    15. Validate Chain
-  7. Mine Pending Pool (solo/pool/cloud)  16. Tamper With a Block (demo) [ADMIN]
-  8. Set Mining Difficulty [ADMIN]        17. Add User Account [ADMIN]
-  9. Difficulty Benchmark                  0. Exit
-```
-
-## How to test the mining simulations
-
-1. Create some pending blocks. For example, borrow `BK001` for `ALU001` (1), borrow `BK002` for `ALU002`
-   (1), mark `BK002` overdue (3), then return both books (2). The first return is on time (10 coins). The
-   second is late (5 coins) because the loan was marked overdue. Option 6 shows the pending pool.
-2. **Solo mining:** choose option 7, then 1. For every block the program shows the nonce, the number of
-   hash attempts, the time and the hash. In the UTXO model it also shows the full UTXO set; in the account
-   model it shows the updated accounts. At the end you see the reward: 50 coins per block plus the fees.
-3. **Pool mining:** choose option 7, then 2, then enter the number of miners (2 to 8). Each miner gets a
-   random hash rate. A table shows each miner's ID, attempts, share percentage and reward, after the 2%
-   pool fee.
-4. **Cloud mining:** choose option 7, then 3, then enter the number of rounds (1 to 5). The rental gives
-   400 attempts per round for a 20-coin fee per round, plus a maintenance fee of 10% of the round's reward.
-   - To see a **profitable** rental: start with `--difficulty 1`, create 2 or 3 pending blocks and rent 2
-     rounds.
-   - To see an **unprofitable** rental (with a warning): start with `--difficulty 3` and rent 2 rounds for
-     one block, or rent 5 rounds when only one block is pending.
-5. **Difficulty:** option 9 mines 20 sample blocks at each difficulty from 1 to 4. Expect about 16, 256,
-   4096 and 65536 attempts on average. Set the difficulty to 4 with option 8 and solo-mine one block to
-   watch it take longer.
-
-## How to test the edge cases
-
-| Test | Steps | Expected result |
-|---|---|---|
-| Overdue book that is never returned | Option 3 on a borrowed book | OVERDUE block with token reward 0 and no transaction |
-| Insufficient balance | Option 11, amount larger than the member's balance | `REJECTED: insufficient ...` |
-| Wrong or reused nonce (account model) | Option 11 with a nonce lower or higher than the one suggested | `REJECTED: invalid nonce ...` |
-| Double spend (UTXO model) | Option 13, enter a confirmed transfer's ID | `REJECTED: double spend rejected: input ... is already spent` |
-| Unconfirmed tokens | Transfer from a member whose reward is still pending | Rejected: tokens can be spent only after mining |
-| Unprofitable cloud rental | See step 4 above | `WARNING: ... UNPROFITABLE` |
-| Tampering | Option 16 then 15, or edit `chain.dat` / `ledger.dat` | Detected and reported |
+Every file is written to a temporary file and renamed, so a crash never leaves half a file. At startup the
+saved inventory and balances are compared with the state rebuilt from the chain; the chain wins if they
+differ.
 
 ## Project layout
 
 ```
 src/
-  main.c         command-line options, model selection, menu
-  app.c/.h       shared state, startup, genesis, full validation, saving
-  lending.c/.h   borrow / return (creates the reward tx) / overdue, book and member lists
-  tokens.c/.h    balances, transfers, history, replay test
-  mining.c/.h    solo / pool / cloud mining, difficulty setting and benchmark
-  pending.c/.h   pending pool (FIFO, saved to pending.dat)
-  blockchain.c/.h  Block struct, signing, SHA-256 block hash, proof of work, chain validation
-  transaction.c/.h Transaction struct, SHA-256 transaction ID, amounts
-  ledger.c/.h    confirmed transaction log, sends each transaction to the chosen model
-  utxo.c/.h      UTXO set: coin selection, change, fees, double-spend checks
-  account.c/.h   accounts: balance, nonce, linked-list history
-  storage.c/.h   atomic binary file save/load with format checks
-  crypto.c/.h    SHA-256 (with a midstate copy for fast mining), ECDSA keys, sign/verify
-  auth.c/.h      accounts, PBKDF2 passwords, roles
-  registry.c/.h  books.txt / members.txt
-  input.c/.h     safe input helpers
-tests/
-  run_tests.sh   automated end-to-end tests (make test)
-docs/
-  Technical Report - Formative 2.pdf / .docx
-  demo_video_script.md     word-for-word video recording script + keystroke cue card
-  viva_questions.md        likely questions and answers about the design
-  submission_checklist.md  requirement-by-requirement evidence and upload steps
-  system_design.svg/.png, screenshots/
+  main.c          options, command table and CLI loop, chain/tamper commands
+  app.c/.h        startup, persistence, validate_chain, request submission, overdue scan
+  record.c/.h     lending record, signing and verification
+  merkle.c/.h     Merkle tree
+  blockchain.c/.h block, proof of work, chain checks
+  state.c/.h      copy inventory, state machine, reservation queues, nonces, fines
+  pending.c/.h    pending pool and priority order
+  fraud.c/.h      fraud heuristics and review commands
+  lending.c/.h    membership, book, copy, lending, fine and history commands
+  tokens.c/.h     token commands
+  mining.c/.h     block building, solo / pool / cloud mining, difficulty
+  ledger, utxo, account, transaction   the two token models
+  crypto, auth, registry, storage, input  SHA-256/ECDSA/keystore, login, registries, files, input
+tests/run_tests.sh    automated end-to-end tests (make test)
+docs/                 Technical Report - Summative (.docx/.pdf), System Design - Summative.pdf, diagrams/
 ```
-
-The program creates these files at runtime (they are not committed): `chain.dat` (confirmed blocks),
-`pending.dat` (pending pool), `ledger.dat` (confirmed transactions), `users.dat` and `keys/`.
-
-## Assumptions
-
-- A loan is 14 days. A return is late if more than 14 days have passed **or** the loan was marked OVERDUE.
-  The OVERDUE mark is what lets you demonstrate a late return without waiting two weeks.
-- Rewards are paid from a `LIBRARY` treasury funded in the genesis block. A member receives the reward
-  minus the 1-coin fee (9 or 4 coins), and the fee goes to the miner.
-- Each confirmed block earns its miner 50 coins plus the fees of the transactions it contains.
-- Members have no keys of their own. The logged-in librarian records and signs every action, including
-  transfers, as in Formative 1.
-- Cloud rental fees are paid to the provider outside the chain. The ledger receives the mining reward
-  minus the maintenance fee.

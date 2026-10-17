@@ -1,9 +1,9 @@
 #!/bin/bash
-# Automated end-to-end tests for the Formative 2 library tracker.
+# Automated end-to-end tests for the summative library tracker.
 #
-# Every test runs the real program in a throw-away folder, feeds it menu
-# input through stdin and checks the output. Your own users.dat, keys/ and
-# chain files are never touched.
+# Every test runs the real program in a throw-away folder, feeds it CLI
+# commands through stdin and checks the output. Your own users.dat, keys/
+# and chain files are never touched.
 #
 # Usage:  make test      (or: bash tests/run_tests.sh from the project folder)
 
@@ -11,11 +11,11 @@ set -u
 PROJECT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$PROJECT/library_tracker"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/lt_tests.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+if [ -n "${KEEP:-}" ]; then echo "(keeping $WORK)"; else trap 'rm -rf "$WORK"' EXIT; fi
 
 PASS=0
 FAIL=0
-USER_LOGIN=$'tester\nTestPass123\n'
+LOGIN=$'tester\nTestPass123\n'
 
 if [ ! -x "$BIN" ]; then
     echo "Build the program first (make)." >&2
@@ -46,116 +46,181 @@ run() {
     (cd "$WORK" && "$BIN" "$@") > "$out" 2>&1
 }
 
-cp "$PROJECT/books.txt" "$PROJECT/members.txt" "$WORK/"
+cp "$PROJECT/books.txt" "$PROJECT/members.txt" "$PROJECT/copies.txt" "$WORK/"
 cd "$WORK" || exit 1
 
-echo "== 1. First run, lending events and token rewards (UTXO model)"
-printf 'tester\nTestPass123\nTestPass123\n%s' "$USER_LOGIN" > in1
-printf '1\nBK001\nALU001\n1\nBK002\nALU002\n3\nBK002\n2\nBK001\nALU001\n2\nBK002\nALU002\n' >> in1
-printf '11\nALU001\nALU003\n2\n6\n10\n0\n' >> in1
-run out1 --model utxo < in1
-check "genesis block mined and chain valid"            "Genesis block mined at difficulty 2" out1
-check "library treasury funded"                         "Library treasury funded with 10000.00 coins" out1
-check "borrow goes to the pending pool"                 "borrowed by John Doe.*PENDING POOL" out1
-check "overdue (not returned) creates no transaction"   "No token transaction created" out1
-check "on-time return gives 10 coins (9 + 1 fee)"       "ON TIME" out1
-check "on-time reward amount"                           "token reward 10 coins from LIBRARY = 9.00 to ALU001" out1
-check "late return gives 5 coins (4 + 1 fee)"           "token reward 5 coins from LIBRARY = 4.00 to ALU002" out1
-check "UTXO change output shown"                        "change back to sender" out1
-check "unconfirmed reward cannot be spent"              "REJECTED: insufficient funds: ALU001 has 0.00 spendable" out1
-check "pending pool lists 5 blocks"                     "Pending pool: 5 unconfirmed block" out1
-check "balances unchanged before mining"                "ALU001 +John Doe +0\.00" out1
+echo "== 1. First run: registries, keys, borrowing, reservations, multi-record blocks"
+{
+    printf 'tester\nTestPass123\nTestPass123\n%s' "$LOGIN"
+    printf 'borrow_book ALU001 BK001\nborrow_book ALU999 BK001\nborrow_book ALU001 BK999\n'
+    printf 'borrow_book ALU002 BK003\nborrow_book ALU003 BK003\nreserve_book ALU003 BK003\n'
+    printf 'pool_view\nmine_solo\nchain_view 1\nexit\n'
+} | run out1 --model utxo --seed 7
+check "genesis block mined"                        "Genesis block mined at difficulty 2" out1
+check "copies loaded from copies.txt"              "Loaded 9 physical copies from copies.txt" out1
+check "member ECDSA key pairs generated"           "Generated 5 member ECDSA P-256 key pair" out1
+check "unknown member rejected"                    "ERROR: Member ALU999 not found" out1
+check "unknown book rejected"                      "ERROR: Book BK999 not found" out1
+check "borrow signed by the member, nonce 0"       "REQ000001 \(BORROWED\) signed by ALU001 with nonce 0" out1
+check "no copy available -> suggest reservation"   "No copy of 'The River Between' is available" out1
+check "reservation accepted"                       "REQ000003 \(RESERVED\) signed by ALU003" out1
+check "pool lists 3 pending requests"              "Pending pool: 3 request\(s\) \(3 PENDING, 0 SUSPICIOUS\)" out1
+check "3 records batched into one block"           "Block body: 3 record\(s\)" out1
+check "hash attempts displayed"                    "Proof of work found: nonce [0-9]+ after [0-9]+ hash attempts" out1
+check "block confirmed, requests removed"          "CONFIRMED as block #1: 3 request" out1
+check "UTXO set printed after the block"           "UTXO set: [0-9]+ confirmed unspent output" out1
+check "Merkle tree printed with root"              "Level 2 \(root\)" out1
 
-echo "== 2. Solo mining confirms the pending pool"
-printf '%s7\n1\n10\n14\n15\n0\n' "$USER_LOGIN" | run out2 --model utxo
-check "every block confirmed"                           "CONFIRMED as block #5" out2
-check "hash attempts reported"                          "Proof of work found: nonce [0-9]+ after [0-9]+ hash attempts" out2
-check "UTXO set printed after confirmed blocks"         "UTXO set: [0-9]+ confirmed unspent output" out2
-check "solo miner paid 5 x 50 + 2 fees"                 "Paid to solo miner  : 252.00 coins" out2
-check "ALU001 credited 9.00 after mining"               "ALU001 +John Doe +9\.00" out2
-check "ALU002 credited 4.00 after mining"               "ALU002 +Jane Smith +4\.00" out2
-check "records show token reward and signature"         "RETURNED +10 +[0-9a-f]{8} +VALID" out2
-check "chain valid after mining"                        "Chain is VALID" out2
+echo "== 2. Restart: validation from disk, on-time return, reservation offer, renewal"
+{
+    printf '%s' "$LOGIN"
+    printf 'renew_book BK001-C1\nreturn_book BK003-C1\nborrow_book ALU001 BK003\nmine_solo\n'
+    printf 'borrow_book ALU003 BK003\nmine_solo\nexit\n'
+} | run out2 --model utxo
+check "saved chain re-validated at startup"         "validate_chain: Chain is VALID. 2 block" out2
+check "renewal extends due date by 7 days"          "renewal 1 of 2" out2
+check "on-time return earns 10 coins"               "reward tx [0-9a-f]+: 10 coins \(9.00 to member \+ 1.00 fee\)" out2
+check "returned copy held for queue head"           "RESERVATION OFFER: returned copy BK003-C1 is now RESERVED for ALU003" out2
+check "others cannot borrow the held copy"          "1 held for reservations" out2
+check "queue member borrows the held copy"          "Copy BK003-C1 was held for ALU003" out2
 
-echo "== 3. UTXO transfer, change, locked inputs and pool mining"
-printf '%s11\nALU001\nALU004\n3\n11\nALU001\nALU005\n5\n7\n2\n4\n0\n' "$USER_LOGIN" | run out3 --model utxo --seed 5
-check "transfer accepted"                               "ACCEPTED: transfer [0-9a-f]+" out3
-check "change returned to sender (9 = 3 + 5 + 1 fee)"   "ALU001 +5\.00 +\(change back to sender\)" out3
-check "second transfer rejected (inputs locked)"        "REJECTED: insufficient funds: ALU001 has 5.00 spendable \(9.00 locked" out3
-check "pool fee is 2%"                                  "Pool fee \(2%\) +: 1.02 coins" out3
-check "pool reward table printed"                       "\| Miner ID +\| Hash rate \| +Attempts \| +Share % \|" out3
-TXID=$(grep -Eo 'ACCEPTED: transfer [0-9a-f]+' out3 | head -1 | awk '{print $3}' | cut -c1-12)
+echo "== 3. Overdue detection, fines, priority, settlement"
+{
+    printf '%s' "$LOGIN"
+    printf 'advance_days 20\npool_view\nreturn_book BK003-C1 GOOD\npool_view\nmine_solo\n'
+    printf 'view_fines ALU003\nsettle_fine ALU003\nsettle_fine ALU003 2 method=cash\nmine_solo\n'
+    printf 'view_fines ALU003\nexit\n'
+} | run out3 --model utxo
+check "overdue copy detected automatically"        "OVERDUE DETECTED: copy BK003-C1" out3
+check "OVERDUE record signed by the librarian"     "\(OVERDUE\) signed by LIB:tester" out3
+check "overdue-related request has priority"       "1   REQ[0-9]+  OVERDUE   BK003-C1" out3
+check "late return detected with a fine"           "LATE by [0-9]+ day\(s\), fine [0-9]+ coin" out3
+check "late return earns 5 coins"                  "5 coins \(4.00 to member \+ 1.00 fee\)" out3
+check "fine owed after mining"                     "ALU003 +Emmanuel +[1-9][0-9]* " out3
+check "token payment refused without funds"        "REJECTED: token transaction: insufficient" out3
+check "cash settlement accepted"                   "\(FINE_PAID\) signed by ALU003" out3
 
-echo "== 4. Double spend is rejected (UTXO replay)"
-printf '%s13\n%s\n10\n0\n' "$USER_LOGIN" "$TXID" | run out4 --model utxo
-check "replayed transfer rejected as double spend"      "REJECTED: double spend rejected: input [0-9a-f]+:[0-9] is already spent" out4
-SUPPLY_UTXO=$(grep -Eo 'Total coins in circulation: [0-9.]+' out4 | tail -1)
+echo "== 4. Replay protection and fraud detection"
+{
+    printf '%s' "$LOGIN"
+    printf 'borrow_book ALU004 BK002 nonce=5\n'
+    printf 'borrow_book ALU002 BK001\nborrow_book ALU002 BK002\nborrow_book ALU002 BK004\nborrow_book ALU002 BK005\n'
+    printf 'return_book BK001-C1 WORN\n'
+    printf 'replay_request REQ000001\nfraud_review\nmine_solo\npool_view\n'
+    printf 'approve_suspicious REQ000001\nreject_suspicious REQ000001\nexit\n'
+} | run out4 --model utxo
+check "wrong nonce rejected"                        "REJECTED: nonce 5 is not ALU004's expected next nonce 0" out4
+check "excessive concurrent borrows flagged"        "SUSPICIOUS: excessive concurrent borrows: ALU002 already holds 3" out4
+check "condition manipulation flagged"              "SUSPICIOUS: condition manipulation: BK001-C1 downgraded NEW -> WORN" out4
+check "duplicate request flagged"                   "FLAGGED: duplicate request: request_id REQ000001" out4
+check "replay keeps a valid signature"              "the ECDSA signature is VALID" out4
+check "suspicious requests withheld from mining"    "Withheld REQ[0-9]+ \(BORROWED\): SUSPICIOUS" out4
+check "duplicate cannot be approved"                "a replay can only be rejected" out4
+check "duplicate rejected in review"                "REJECTED: REQ000001 discarded" out4
 
-echo "== 5. Account model: same balances, nonce and balance checks"
-printf '%s10\n' "$USER_LOGIN" > in5
-printf '11\nALU001\nALU004\n1\n0\n' >> in5                      # reused nonce
-printf '11\nALU001\nALU004\n1\n7\n' >> in5                      # skipped nonce
-printf '11\nALU004\nALU001\n50\n0\n' >> in5                     # insufficient balance
-printf '11\nALU001\nALU004\n1\n1\n' >> in5                      # correct
-printf '13\n%s\n12\nALU001\n0\n' "$TXID" >> in5
-run out5 --model account < in5
-SUPPLY_ACC=$(grep -Eo 'Total coins in circulation: [0-9.]+' out5 | head -1)
-if [ -n "$SUPPLY_UTXO" ] && [ "$SUPPLY_UTXO" = "$SUPPLY_ACC" ]; then
-    PASS=$((PASS + 1)); echo "  PASS  both models give the same total supply ($SUPPLY_ACC)"
-else
-    FAIL=$((FAIL + 1)); echo "  FAIL  models disagree: '$SUPPLY_UTXO' vs '$SUPPLY_ACC'"
-fi
-check "reused nonce rejected"                           "REJECTED: invalid nonce: nonce 0 was already used" out5
-check "skipped nonce rejected"                          "REJECTED: invalid nonce: 7 skips ahead" out5
-check "insufficient balance rejected"                   "REJECTED: insufficient balance: ALU004 has 3.00 available" out5
-check "correct nonce accepted"                          "nonce 1 accepted for ALU001" out5
-check "replay rejected by nonce"                        "Account model: the sender's nonce moved past 0" out5
-check "history printed from the linked list"            "Transaction history for ALU001 \(linked list, 2 entries" out5
+echo "== 5. Review workflow and re-borrow heuristic"
+RET_ID=$(grep -Eo "FLAGGED: request REQ[0-9]+ \(RETURNED\)" out4 | grep -Eo "REQ[0-9]+")
+{
+    printf '%s' "$LOGIN"
+    printf 'fraud_review\napprove_suspicious %s\nmine_solo\n' "$RET_ID"
+    printf 'borrow_book ALU001 BK001\nexit\n'
+} | run out5 --model utxo
+check "approved request becomes PENDING"            "APPROVED: $RET_ID" out5
+check "approved return is mined"                    "$RET_ID +RETURNED" out5
+check "rapid re-borrow flagged"                     "SUSPICIOUS: rapid re-borrow: ALU001 returned BK001" out5
 
-echo "== 6. Cloud mining: profitable and unprofitable rentals"
-printf '%s1\nBK003\nALU003\n7\n3\n1\n0\n' "$USER_LOGIN" | run out6 --model account --difficulty 1
-check "cloud summary printed"                           "Cloud mining: multi-round earnings summary" out6
-check "short rental is profitable"                      "The rental was profitable in every round" out6
-printf '%s1\nBK004\nALU004\n7\n3\n5\n0\n' "$USER_LOGIN" | run out7 --model utxo --difficulty 1
-check "5 rounds for 1 block triggers the warning"       "WARNING: after round [0-9] the cumulative fees" out7
-check "overall loss reported"                           "WARNING: This rental was UNPROFITABLE overall" out7
-check "gross, fees and net printed"                     "Net profit +: -[0-9]" out7
+echo "== 6. Tokens: UTXO change and double spend; account nonces and history"
+EXC_ID=$(grep -Eo "FLAGGED: request REQ[0-9]+ \(BORROWED\)" out4 | grep -Eo "REQ[0-9]+" | head -1)
+REB_ID=$(grep -Eo "FLAGGED: request REQ[0-9]+ \(BORROWED\)" out5 | grep -Eo "REQ[0-9]+" | head -1)
+{
+    printf '%s' "$LOGIN"
+    printf 'reject_suspicious %s\nreject_suspicious %s\n' "$EXC_ID" "$REB_ID"
+    printf 'token_transfer ALU002 ALU005 3\nmine_solo\nutxo_view ALU002\nexit\n'
+} | run out6 --model utxo
+TXID=$(grep -Eo "ACCEPTED: transfer [0-9a-f]{16}" out6 | head -1 | awk '{print $3}')
+printf '%sreplay_tx %s\nexit\n' "$LOGIN" "${TXID:0:12}" | run out6b --model utxo
+check "transfer change returned to sender"          "change back to sender" out6
+check "UTXO double spend rejected"                  "REJECTED: double spend rejected" out6b
+check "rejected flags free the member's later requests" "REQ[0-9]+  TRANSFER" out6
+{
+    printf '%s' "$LOGIN"
+    printf 'account_transfer ALU005 ALU001 1 7\naccount_transfer ALU005 ALU001 1 0\nmine_solo\n'
+    printf 'account_balance ALU005\naccount_nonce ALU005\ntransaction_history ALU005\nexit\n'
+} | run out7 --model account
+check "account model: skipped nonce rejected"       "invalid nonce: 7 skips ahead" out7
+check "account model: correct nonce accepted"       "ACCEPTED: transfer .* account nonce 0" out7
+check "account nonce incremented on confirmation"   "Account ALU005: nonce 1" out7
+check "history printed from the linked list"        "Transaction history for ALU005 \(linked list" out7
 
-echo "== 7. Difficulty"
-printf '%s9\n8\n4\n1\nBK005\nALU005\n7\n1\n0\n' "$USER_LOGIN" | run out8 --model utxo
-check "benchmark expected attempts 16^4"                "^4 +0000\.\.\. +65536" out8
-check "difficulty changed to 4 from the menu"           "Difficulty set to 4" out8
-check "block mined with 4 leading zeros"                "Block hash: 0000[0-9a-f]{60}" out8
-printf '' | run out9 --difficulty 7; RC=$?
-check "--difficulty 7 rejected"                         "--difficulty must be a number from 1 to 4" out9
-if [ "$RC" -ne 0 ]; then PASS=$((PASS + 1)); echo "  PASS  invalid argument exits with an error code"
-else FAIL=$((FAIL + 1)); echo "  FAIL  invalid argument should exit with an error code"; fi
+echo "== 7. Pool and cloud mining, difficulty"
+{
+    printf '%s' "$LOGIN"
+    printf 'token_transfer ALU001 ALU005 0.5\nmine_pool 4\n'
+    printf 'token_transfer ALU001 ALU002 0.5\nmine_cloud 5\n'
+    printf 'difficulty_status\nset_difficulty 4\ntoken_transfer ALU001 ALU003 0.5\nmine_solo\nexit\n'
+} | run out8 --model utxo --seed 3
+check "pool fee is 2%"                              "Pool fee \(2%\)" out8
+check "pool table shows shares and rewards"         "\| Miner ID  \| Hash rate \|   Attempts \|  Share % \| Blocks \|      Reward \|" out8
+check "cloud mining multi-round summary"            "Cloud mining: multi-round earnings summary" out8
+check "cloud gross, fees and net printed"           "Net profit       :" out8
+check "cloud warning when fees exceed rewards"      "WARNING: after round [0-9] the cumulative fees" out8
+check "difficulty status"                           "Expected effort : ~256 hash attempts" out8
+check "difficulty 4 block has 4 leading zeros"      "Block hash: 0000" out8
+printf '%s' "$LOGIN" | run out9 --model utxo --difficulty 7
+check "--difficulty 7 rejected"                     "ERROR: --difficulty must be a number from 1 to 4" out9
 
-echo "== 8. Tamper detection"
-printf '%s16\n2\n5\n10\n15\n1\nBK001\nALU001\n0\n' "$USER_LOGIN" | run out10 --model utxo
-check "re-mined block: signature fails"                 "Block #5: librarian's digital signature does not verify" out10
-check "re-mined block: reward mismatches its tx"        "Block #5: token reward 10 does not match its reward transaction" out10
-check "re-mined block: next link broken"                "Block #6: previous_hash does not match" out10
-check "new blocks refused on an invalid chain"          "Refusing to add or mine blocks on an invalid chain" out10
-printf '%s15\n0\n' "$USER_LOGIN" | run out11 --model utxo
-check "restart reloads the genuine chain"               "Chain is VALID" out11
-cp ledger.dat ledger.bak
-python3 - <<'EOF'
-d = bytearray(open('ledger.dat', 'rb').read())
-i = d.find(b'late return reward')
-d[i:i + 4] = b'LATE'
-open('ledger.dat', 'wb').write(d)
-EOF
-printf '%s' "$USER_LOGIN" | run out12 --model utxo
-check "edited ledger.dat detected at startup"           "does not match its SHA-256 ID. The ledger file was modified" out12
-mv ledger.bak ledger.dat
+echo "== 8. Registration and persistence of runtime additions"
+{
+    printf '%s' "$LOGIN"
+    printf 'register_member ALU006 "Jane Doe" BLK103\nregister_member 12X "Bad" BLK1\n'
+    printf 'register_book BK006 "Arrow of God" "Chinua Achebe" copies=2\nadd_copy BK003 GOOD\n'
+    printf 'borrow_book ALU006 BK006 due=2026-02-30\nborrow_book ALU006 BK006 due=2020-01-01\n'
+    printf 'borrow_book ALU006 BK006\nmark_lost BK006-C2 SHELF_MISSING\nmine_solo\nexit\n'
+} | run out10 --model utxo
+check "member registered with key pair"             "SUCCESS: Member ALU006 .* registered" out10
+check "invalid member ID format rejected"           "ERROR: invalid member ID '12X'" out10
+check "book registered with copies"                 "Copy BK006-C2 added" out10
+check "copy added"                                  "SUCCESS: Copy BK003-C2" out10
+check "impossible date rejected"                    "Invalid due date '2026-02-30'" out10
+check "past date rejected"                          "The due date 2020-01-01 is in the past" out10
+check "mark_lost with reason code"                  "\(LOST\) signed by LIB:tester" out10
+printf '%sexit\n' "$LOGIN" | run out11 --model account
+check "chain with every record type re-validates"   "validate_chain: Chain is VALID" out11
+check "model switch replays same ledger"            "into the Account-based model" out11
 
-echo "== 9. Access control"
-printf '%s17\n1\nlibrarian1\nLibPass1234\nLibPass1234\n0\n' "$USER_LOGIN" | run out13 --model utxo
-printf 'librarian1\nLibPass1234\n8\n16\n0\n' | run out14 --model utxo
-check "librarian created"                               "LIBRARIAN account 'librarian1' created" out13
-check "librarian cannot change difficulty or tamper"    "Access denied. This action requires the ADMIN role" out14
-check_not "librarian session has no crash"              "Segmentation|Abort" out14
+echo "== 9. Tamper detection"
+printf '%stamper_block 1 record\nvalidate_chain\nborrow_book ALU004 BK002\nchain_load\nexit\n' "$LOGIN" | run out12 --model utxo
+check "edited record: Merkle root mismatch"         "Block #1: Merkle root recomputed .* does not match" out12
+check "edited record: signature fails"              "Block #1: record REQ[0-9]+ .*ECDSA signature .* does not verify" out12
+check "tampered session refuses new requests"       "ERROR: Session locked" out12
+check "chain_load restores the genuine chain"       "Chain reloaded: .* pending request" out12
+printf '%stamper_block 1 header\nvalidate_chain\nexit\n' "$LOGIN" | run out13 --model utxo
+check "edited header: block hash mismatch"          "Block #1: stored hash does not match the recomputed hash" out13
+printf '%stamper_block 1 remine\nvalidate_chain\nexit\n' "$LOGIN" | run out14 --model utxo
+check "re-mined block: next link broken"            "Block #2: previous_hash does not match block #1" out14
+cp chain.dat chain.bak
+python3 -I -c "
+d=bytearray(open('chain.dat','rb').read()); i=d.find(b'Americanah'); d[i+1]=ord('X'); open('chain.dat','wb').write(d)"
+printf '%sborrow_book ALU004 BK002\nexit\n' "$LOGIN" | run out15 --model utxo
+check "edited chain.dat detected at startup"        "validate_chain: Chain is INVALID" out15
+check "session locked until chain is restored"      "SESSION LOCKED" out15
+cp chain.bak chain.dat
+cp keys/members/ALU002_public.pem k.bak && cp keys/members/ALU004_public.pem keys/members/ALU002_public.pem
+printf '%sexit\n' "$LOGIN" | run out16 --model utxo
+check "swapped member key detected"                 "is signed by a key that is not ALU002's registered public key" out16
+cp k.bak keys/members/ALU002_public.pem
+printf '%sexit\n' "$LOGIN" | run out17 --model utxo
+check "restored files validate again"               "validate_chain: Chain is VALID" out17
+
+echo "== 10. Access control and missing files"
+printf '%sadd_user\n1\nlibrarian1\nLibPass1234\nLibPass1234\nexit\n' "$LOGIN" | run out18 --model utxo
+printf 'librarian1\nLibPass1234\nset_difficulty 3\ntamper_block 1 header\nexit\n' | run out19 --model utxo
+check "librarian created"                           "SUCCESS: LIBRARIAN account 'librarian1' created" out18
+check "librarian cannot change difficulty"          "requires the ADMIN role" out19
+mv copies.txt copies.bak
+printf '%sexit\n' "$LOGIN" | run out20 --model utxo
+check "missing copies.txt reported"                 "Could not open copy inventory file 'copies.txt'" out20
+mv copies.bak copies.txt
 
 echo
 echo "Result: $PASS passed, $FAIL failed"
