@@ -60,15 +60,19 @@ test: $(TARGET)
 	bash tests/run_tests.sh
 
 # Submission archive: source, docs, tests, registries (no binary, data or keys).
-DIST = Formative2_Golden_Munyankindi.zip
+DIST = Summative_Golden_Munyankindi.zip
 dist:
 	rm -f $(DIST)
-	zip -r $(DIST) Makefile README.md books.txt members.txt .gitignore src tests docs -x '*.DS_Store'
+	zip -r $(DIST) Makefile README.md books.txt members.txt copies.txt .gitignore src tests docs \
+	    -x '*.DS_Store' 'docs/Technical Report - Formative 2*' 'docs/screenshots/*' 'docs/system_design.*' \
+	       'docs/demo_video_script.md'
 
-# Removes the binary, the chain, the pending pool and the token ledger
-# (keeps user accounts and keys).
+# Saved state written by the program (see README, "Disk persistence").
+STATE_FILES = chain.dat pending.dat ledger.dat library_state.dat balances.dat utxo.dat meta.dat
+
+# Removes the binary and all saved chain state (keeps user accounts and keys).
 clean:
-	rm -f $(TARGET) chain.dat chain.dat.tmp pending.dat pending.dat.tmp ledger.dat ledger.dat.tmp
+	rm -f $(TARGET) $(STATE_FILES) $(addsuffix .tmp,$(STATE_FILES))
 
 # Full reset: also deletes all user accounts and their key pairs.
 distclean: clean

@@ -9,6 +9,12 @@ keys/
 ledger.dat
 ledger.dat.tmp
 Formative2_*.zip
+Summative_*.zip
+library_state.dat
+balances.dat
+utxo.dat
+meta.dat
+*.dat.tmp
 
 # Personal notes, not part of the submission
 docs/demo_video_script.md
