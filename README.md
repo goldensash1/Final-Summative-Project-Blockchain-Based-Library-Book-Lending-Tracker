@@ -39,7 +39,7 @@ Silicon Mac, it builds an x86_64 binary that runs under Rosetta 2.
 
 ```bash
 make            # builds ./library_tracker from every file in src/ with -Wall -Wextra
-make test       # 76 automated end-to-end checks in a temporary folder
+make test       # 78 automated end-to-end checks in a temporary folder
 make clean      # removes the binary and all saved chain state (keeps accounts and keys)
 make distclean  # full reset: also removes users.dat and keys/
 make dist       # creates Summative_Golden_Munyankindi.zip
