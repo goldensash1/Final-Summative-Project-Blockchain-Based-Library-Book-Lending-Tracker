@@ -3,14 +3,16 @@
 #include <string.h>
 
 #include "blockchain.h"
+#include "merkle.h"
 
 #define INITIAL_CAPACITY 16
 #define MAX_CHAIN_BLOCKS 1000000   /* sanity bound when loading from disk */
-#define CONTENT_BUF 512
 #define HEADER_BUF 512
 #define NONCE_BUF 24
 
-static const char CHAIN_MAGIC[4] = {'L', 'B', 'C', '2'};
+/* "LBC3": the summative block layout (multi-record blocks with a Merkle
+ * root). Files from Formative 1/2 ("LBC1"/"LBC2") are refused on load. */
+static const char CHAIN_MAGIC[4] = {'L', 'B', 'C', '3'};
 
 static void copy_field(char *dst, size_t dst_size, const char *src) {
     strncpy(dst, src, dst_size - 1);
@@ -19,95 +21,68 @@ static void copy_field(char *dst, size_t dst_size, const char *src) {
 
 /* ======================= Hashing ======================= */
 
-/* The lending content: everything the librarian signs. */
-static int build_content(const Block *b, char *buf, size_t size) {
-    int n = snprintf(buf, size, "%ld|%s|%s|%s|%s|%s|%s|%d|%s",
-                     (long)b->timestamp, b->book_id, b->book_title,
-                     b->member_id, b->member_name, b->action, b->recorded_by,
-                     b->token_reward, b->tx_id);
+/* Everything the block hash commits to, except the nonce. The nonce is
+ * appended last so mining can reuse a SHA-256 midstate of this prefix.
+ * Returns the prefix length, or -1 for a malformed block. */
+static int build_header_prefix(const Block *b, char *buf, size_t size) {
+    int n = snprintf(buf, size, "%d|%ld|%d|%s|%s|%s|%d|%s|%d|",
+                     b->index, (long)b->timestamp, b->record_count, b->previous_hash,
+                     b->merkle_root, b->sealed_by, b->token_reward, b->transaction_id,
+                     b->difficulty);
     return (n < 0 || (size_t)n >= size) ? -1 : n;
 }
 
-static int content_hash(const Block *b, char out_hex[SHA256_HEX_LEN + 1]) {
-    char buf[CONTENT_BUF];
-    int len = build_content(b, buf, sizeof(buf));
-    if (len < 0) {
-        out_hex[0] = '\0';
-        return 0;
-    }
-    sha256_hex((const unsigned char *)buf, (size_t)len, out_hex);
-    return out_hex[0] != '\0';
-}
-
-/* Everything the block hash commits to, except the nonce:
- *   index | previous_hash | content_hash | difficulty | mined_by | signature |
- * The nonce is appended last, so mining can reuse a SHA-256 midstate of this
- * prefix. Returns the prefix length, or -1 for a malformed block. */
-static int build_header_prefix(const Block *b, unsigned char *buf, size_t size) {
-    char chash[SHA256_HEX_LEN + 1];
-    if (!content_hash(b, chash) || b->sig_len > MAX_SIGNATURE_LEN) return -1;
-
-    int n = snprintf((char *)buf, size, "%d|%s|%s|%d|%s|",
-                     b->index, b->previous_hash, chash, b->difficulty, b->mined_by);
-    if (n < 0 || (size_t)n + b->sig_len + 1 >= size) return -1;
-
-    memcpy(buf + n, b->signature, b->sig_len);
-    n += (int)b->sig_len;
-    buf[n++] = '|';
-    return n;
-}
-
 void block_compute_hash(const Block *b, char out_hex[SHA256_HEX_LEN + 1]) {
-    unsigned char buf[HEADER_BUF + NONCE_BUF];
+    char buf[HEADER_BUF + NONCE_BUF];
     int n = build_header_prefix(b, buf, HEADER_BUF);
     if (n < 0) {
-        /* Malformed block (e.g. unterminated strings from a corrupted file):
-         * produce a hash that can never match a real one. */
-        out_hex[0] = '\0';
+        out_hex[0] = '\0';   /* never matches a real hash */
         return;
     }
-    n += snprintf((char *)buf + n, NONCE_BUF, "%llu", b->nonce);
-    sha256_hex(buf, (size_t)n, out_hex);
+    n += snprintf(buf + n, NONCE_BUF, "%llu", b->nonce);
+    sha256_hex((const unsigned char *)buf, (size_t)n, out_hex);
 }
 
-int block_init_signed(Block *b, const char *book_id, const char *book_title,
-                      const char *member_id, const char *member_name, const char *action,
-                      int token_reward, const char *tx_id,
-                      const char *signer, EVP_PKEY *signing_key) {
-    memset(b, 0, sizeof(Block));
-    b->index = -1;   /* assigned by the miner */
-    b->timestamp = time(NULL);
-    copy_field(b->book_id, sizeof(b->book_id), book_id);
-    copy_field(b->book_title, sizeof(b->book_title), book_title);
-    copy_field(b->member_id, sizeof(b->member_id), member_id);
-    copy_field(b->member_name, sizeof(b->member_name), member_name);
-    copy_field(b->action, sizeof(b->action), action);
-    copy_field(b->recorded_by, sizeof(b->recorded_by), signer);
-    b->token_reward = token_reward;
-    copy_field(b->tx_id, sizeof(b->tx_id), tx_id ? tx_id : ZERO_HASH);
+int block_reward_summary(const Block *b, int *token_reward, char txid_out[SHA256_HEX_LEN + 1]) {
+    if (b->record_count < 0 || b->record_count > MAX_RECORDS_PER_BLOCK) return 0;
 
-    char chash[SHA256_HEX_LEN + 1];
-    return content_hash(b, chash) &&
-           crypto_sign_hash(signing_key, chash, b->signature, &b->sig_len);
+    int reward = 0, rewards = 0;
+    char concat[MAX_RECORDS_PER_BLOCK * SHA256_HEX_LEN + 1] = "";
+    const char *single = NULL;
+    for (int i = 0; i < b->record_count; i++) {
+        if (b->records[i].action != ACT_RETURNED) continue;
+        reward += b->records[i].token_reward;
+        if (strcmp(b->reward_txids[i], ZERO_HASH) == 0) continue;
+        single = b->reward_txids[i];
+        strcat(concat, b->reward_txids[i]);
+        rewards++;
+    }
+    *token_reward = reward;
+
+    /* One return: transaction_id is that reward transaction's SHA-256 ID.
+     * Several returns: the SHA-256 of their IDs in block order. */
+    if (rewards == 0) copy_field(txid_out, SHA256_HEX_LEN + 1, ZERO_HASH);
+    else if (rewards == 1) copy_field(txid_out, SHA256_HEX_LEN + 1, single);
+    else sha256_hex((const unsigned char *)concat, strlen(concat), txid_out);
+    return txid_out[0] != '\0';
 }
 
-int block_signature_valid(const Block *b) {
-    char chash[SHA256_HEX_LEN + 1];
-    return content_hash(b, chash) &&
-           crypto_verify_hash(b->recorded_by, chash, b->signature, b->sig_len);
+int block_finalize_body(Block *b) {
+    return merkle_root(b->records, b->record_count, b->merkle_root) &&
+           block_reward_summary(b, &b->token_reward, b->transaction_id);
 }
 
 void block_sanitize(Block *b) {
-    b->book_id[sizeof(b->book_id) - 1] = '\0';
-    b->book_title[sizeof(b->book_title) - 1] = '\0';
-    b->member_id[sizeof(b->member_id) - 1] = '\0';
-    b->member_name[sizeof(b->member_name) - 1] = '\0';
-    b->action[sizeof(b->action) - 1] = '\0';
-    b->recorded_by[sizeof(b->recorded_by) - 1] = '\0';
     b->previous_hash[sizeof(b->previous_hash) - 1] = '\0';
+    b->merkle_root[sizeof(b->merkle_root) - 1] = '\0';
     b->hash[sizeof(b->hash) - 1] = '\0';
-    b->tx_id[sizeof(b->tx_id) - 1] = '\0';
-    b->mined_by[sizeof(b->mined_by) - 1] = '\0';
+    b->sealed_by[sizeof(b->sealed_by) - 1] = '\0';
+    b->transaction_id[sizeof(b->transaction_id) - 1] = '\0';
+    if (b->record_count < 0 || b->record_count > MAX_RECORDS_PER_BLOCK) b->record_count = 0;
+    for (int i = 0; i < MAX_RECORDS_PER_BLOCK; i++) {
+        record_sanitize(&b->records[i]);
+        b->reward_txids[i][SHA256_HEX_LEN] = '\0';
+    }
 }
 
 /* ======================= Proof of work ======================= */
@@ -127,7 +102,7 @@ double pow_expected_attempts(int difficulty) {
     return attempts;
 }
 
-/* Same test as hash_meets_difficulty, on the raw digest: each hex character
+/* Same test as hash_meets_difficulty on the raw digest: each hex character
  * is one 4-bit nibble. Avoids hex-encoding every failed attempt. */
 static int digest_meets_difficulty(const unsigned char *digest, int difficulty) {
     for (int i = 0; i < difficulty; i++) {
@@ -143,14 +118,14 @@ int pow_begin(PowJob *job, Block *b, int index, const char *previous_hash,
     b->index = index;
     copy_field(b->previous_hash, sizeof(b->previous_hash), previous_hash);
     b->difficulty = difficulty;
-    copy_field(b->mined_by, sizeof(b->mined_by), miner);
+    copy_field(b->sealed_by, sizeof(b->sealed_by), miner);
     b->nonce = 0;
     b->hash[0] = '\0';
     job->difficulty = difficulty;
 
-    unsigned char buf[HEADER_BUF];
+    char buf[HEADER_BUF];
     int n = build_header_prefix(b, buf, sizeof(buf));
-    return n >= 0 && sha256_prefix_init(&job->sha, buf, (size_t)n);
+    return n >= 0 && sha256_prefix_init(&job->sha, (const unsigned char *)buf, (size_t)n);
 }
 
 int pow_try(PowJob *job, unsigned long long nonce, char out_hash[SHA256_HEX_LEN + 1]) {
@@ -209,8 +184,6 @@ void chain_free(Blockchain *chain) {
     chain->capacity = 0;
 }
 
-/* Ensures room for at least `needed` blocks. Returns 0 if out of memory
- * (the existing blocks are left untouched). */
 static int chain_reserve(Blockchain *chain, int needed) {
     int new_capacity = chain->capacity > 0 ? chain->capacity : INITIAL_CAPACITY;
     while (new_capacity < needed) new_capacity *= 2;
@@ -230,13 +203,25 @@ const char *chain_tip_hash(const Blockchain *chain) {
     return chain->count > 0 ? chain->blocks[chain->count - 1].hash : ZERO_HASH;
 }
 
+time_t chain_tip_time(const Blockchain *chain) {
+    return chain->count > 0 ? chain->blocks[chain->count - 1].timestamp : 0;
+}
+
 int chain_append(Blockchain *chain, const Block *b) {
     if (b->index != chain->count || strcmp(b->previous_hash, chain_tip_hash(chain)) != 0) {
         printf("ERROR: Block does not extend the current chain tip\n");
         return 0;
     }
+    if (chain->count > 0 && b->timestamp <= chain_tip_time(chain)) {
+        printf("ERROR: Block timestamp is not later than the previous block\n");
+        return 0;
+    }
 
-    char recomputed[SHA256_HEX_LEN + 1];
+    char root[SHA256_HEX_LEN + 1], recomputed[SHA256_HEX_LEN + 1];
+    if (!merkle_root(b->records, b->record_count, root) || strcmp(root, b->merkle_root) != 0) {
+        printf("ERROR: Block Merkle root does not match its records\n");
+        return 0;
+    }
     block_compute_hash(b, recomputed);
     if (recomputed[0] == '\0' || strcmp(recomputed, b->hash) != 0 ||
         !hash_meets_difficulty(b->hash, b->difficulty)) {
@@ -253,71 +238,88 @@ void chain_pop(Blockchain *chain) {
     if (chain->count > 0) chain->count--;
 }
 
-ChainValidationResult chain_check_block(const Blockchain *chain, int i) {
+int chain_check_block(const Blockchain *chain, int i, int print) {
     const Block *b = &chain->blocks[i];
+    int problems = BLOCK_OK;
 
+    if (b->index != i) {
+        problems |= BLOCK_BAD_INDEX;
+        if (print) printf("  Block #%d: stored index is %d\n", i, b->index);
+    }
+
+    /* 1. Recomputed block hash against the stored one. */
     char recomputed[SHA256_HEX_LEN + 1];
     block_compute_hash(b, recomputed);
-    if (recomputed[0] == '\0' || strcmp(recomputed, b->hash) != 0) return CHAIN_BAD_HASH;
+    if (recomputed[0] == '\0' || strcmp(recomputed, b->hash) != 0) {
+        problems |= BLOCK_BAD_HASH;
+        if (print) printf("  Block #%d: stored hash does not match the recomputed hash "
+                          "(header changed after mining)\n", i);
+    }
 
+    /* 2. Hash-pointer link to the previous block. */
     const char *expected_prev = (i == 0) ? ZERO_HASH : chain->blocks[i - 1].hash;
-    if (b->index != i || strcmp(b->previous_hash, expected_prev) != 0) return CHAIN_BROKEN_LINK;
-
-    if (!block_signature_valid(b)) return CHAIN_BAD_SIGNATURE;
-
-    if (!hash_meets_difficulty(b->hash, b->difficulty)) return CHAIN_BAD_POW;
-
-    return CHAIN_VALID;
-}
-
-const char *chain_result_message(ChainValidationResult result) {
-    switch (result) {
-        case CHAIN_VALID:
-            return "valid";
-        case CHAIN_BAD_HASH:
-            return "stored hash does not match its recomputed hash (data was changed after mining)";
-        case CHAIN_BROKEN_LINK:
-            return "previous_hash does not match the preceding block's hash (chain link broken)";
-        case CHAIN_BAD_SIGNATURE:
-            return "librarian's digital signature does not verify (content changed after signing)";
-        case CHAIN_BAD_POW:
-            return "hash does not meet its proof-of-work difficulty target";
-    }
-    return "unknown error";
-}
-
-static void format_timestamp(time_t t, char *buf, size_t size) {
-    struct tm *tm_info = localtime(&t);
-    if (!tm_info || strftime(buf, size, "%Y-%m-%d %H:%M:%S", tm_info) == 0) {
-        snprintf(buf, size, "%ld", (long)t);
-    }
-}
-
-void chain_print_records(const Blockchain *chain) {
-    if (chain->count == 0) {
-        printf("(no blocks in chain)\n");
-        return;
+    if (strcmp(b->previous_hash, expected_prev) != 0) {
+        problems |= BLOCK_BROKEN_LINK;
+        if (print) printf("  Block #%d: previous_hash does not match block #%d's hash "
+                          "(chain link broken)\n", i, i - 1);
     }
 
-    printf("\nConfirmed lending records (%d block(s)):\n", chain->count);
-    printf("%-4s %-22s %-16s %-9s %-6s %-9s %-7s %-19s %-12s %-2s %-8s %s\n",
-           "Idx", "Book Title", "Member Name", "Action", "Reward", "Tx ID", "SigOK",
-           "Timestamp", "Mined By", "D", "Nonce", "Hash");
-    for (int i = 0; i < 136; i++) putchar('-');
-    putchar('\n');
-
-    for (int i = 0; i < chain->count; i++) {
-        const Block *b = &chain->blocks[i];
-        char ts[32];
-        format_timestamp(b->timestamp, ts, sizeof(ts));
-        int has_tx = strcmp(b->tx_id, ZERO_HASH) != 0;
-
-        printf("%-4d %-22.22s %-16.16s %-9.9s %-6d %-9.8s %-7s %-19s %-12.12s %-2d %-8llu %.16s...\n",
-               b->index, b->book_title, b->member_name, b->action, b->token_reward,
-               has_tx ? b->tx_id : "-", block_signature_valid(b) ? "VALID" : "INVALID",
-               ts, b->mined_by, b->difficulty, b->nonce, b->hash);
+    /* 3. Proof of work. */
+    if (!hash_meets_difficulty(b->hash, b->difficulty)) {
+        problems |= BLOCK_BAD_POW;
+        if (print) printf("  Block #%d: hash does not meet its difficulty %d\n", i, b->difficulty);
     }
-    printf("\n");
+
+    /* 4. Timestamps strictly increase. */
+    if (i > 0 && b->timestamp <= chain->blocks[i - 1].timestamp) {
+        problems |= BLOCK_BAD_TIMESTAMP;
+        if (print) printf("  Block #%d: timestamp is not later than block #%d's\n", i, i - 1);
+    }
+
+    if (b->record_count < 0 || b->record_count > MAX_RECORDS_PER_BLOCK ||
+        (i == 0 && b->record_count != 0) || (i > 0 && b->record_count == 0)) {
+        problems |= BLOCK_BAD_SUMMARY;
+        if (print) printf("  Block #%d: invalid record_count %d\n", i, b->record_count);
+        return problems;
+    }
+
+    /* 5. Record integrity: recompute the Merkle root from the records. */
+    char root[SHA256_HEX_LEN + 1];
+    if (!merkle_root(b->records, b->record_count, root) || strcmp(root, b->merkle_root) != 0) {
+        problems |= BLOCK_BAD_MERKLE;
+        if (print) printf("  Block #%d: Merkle root recomputed from its %d record(s) does not "
+                          "match merkle_root (a record was changed)\n", i, b->record_count);
+    }
+
+    /* 6. Every record's ECDSA signature, and that it was made with the
+     *    signer's registered key. */
+    for (int r = 0; r < b->record_count; r++) {
+        const LendingRecord *rec = &b->records[r];
+        if (!record_signature_valid(rec)) {
+            problems |= BLOCK_BAD_SIGNATURE;
+            if (print) printf("  Block #%d: record %s (%s): ECDSA signature by %s does not "
+                              "verify\n", i, rec->record_id, record_action_name(rec->action),
+                              rec->signer);
+        } else if (!record_signer_registered(rec)) {
+            problems |= BLOCK_BAD_SIGNER;
+            if (print) printf("  Block #%d: record %s is signed by a key that is not %s's "
+                              "registered public key\n", i, rec->record_id, rec->signer);
+        }
+    }
+
+    /* 7. token_reward and transaction_id summarise the records. Genesis
+     *    instead references the treasury coinbase (checked by the app). */
+    if (i > 0) {
+        int reward;
+        char txid[SHA256_HEX_LEN + 1];
+        if (!block_reward_summary(b, &reward, txid) || reward != b->token_reward ||
+            strcmp(txid, b->transaction_id) != 0) {
+            problems |= BLOCK_BAD_SUMMARY;
+            if (print) printf("  Block #%d: token_reward/transaction_id do not match its "
+                              "RETURNED records\n", i);
+        }
+    }
+    return problems;
 }
 
 int chain_save(const Blockchain *chain, const char *path) {
@@ -341,29 +343,62 @@ StorageResult chain_load(Blockchain *chain, const char *path) {
     chain->blocks = records;
     chain->count = count;
     chain->capacity = count;
-
-    /* Any real change still fails validation; this only stops reads past
-     * the end of a field. */
     for (int i = 0; i < count; i++) block_sanitize(&chain->blocks[i]);
     return STORAGE_OK;
 }
 
-int chain_tamper_action(Blockchain *chain, int index, const char *new_action) {
-    if (index < 0 || index >= chain->count) return 0;
-    copy_field(chain->blocks[index].action, sizeof(chain->blocks[index].action), new_action);
-    /* Deliberately NOT recomputing the hash -- this is the tamper demo. */
-    return 1;
+void chain_print_summary(const Blockchain *chain) {
+    printf("\nBlockchain: %d block(s)\n", chain->count);
+    printf("%-4s %-16s %4s %-14s %-14s %-12s %6s %-10s %2s %8s %s\n", "Idx", "Timestamp", "Recs",
+           "Prev hash", "Merkle root", "Sealed by", "Reward", "Tx ID", "D", "Nonce", "Hash");
+    for (int i = 0; i < 128; i++) putchar('-');
+    putchar('\n');
+    for (int i = 0; i < chain->count; i++) {
+        const Block *b = &chain->blocks[i];
+        char ts[24];
+        format_datetime(b->timestamp, ts, sizeof(ts));
+        int has_tx = strcmp(b->transaction_id, ZERO_HASH) != 0;
+        printf("%-4d %-16s %4d %.12s.. %.12s.. %-12.12s %6d %-10.8s %2d %8llu %.20s...\n",
+               b->index, ts, b->record_count, b->previous_hash, b->merkle_root, b->sealed_by,
+               b->token_reward, has_tx ? b->transaction_id : "-", b->difficulty, b->nonce, b->hash);
+    }
+    printf("Use 'chain_view <index>' to see a block's records and Merkle tree.\n");
 }
 
-unsigned long long chain_tamper_reward(Blockchain *chain, int index, int new_reward) {
-    if (index < 0 || index >= chain->count) return 0;
-    Block *b = &chain->blocks[index];
-    b->token_reward = new_reward;
-
-    /* Re-mine at the same position, so the block's own hash and PoW are
-     * valid again. Copies avoid passing a field as both source and target. */
-    char prev[sizeof(b->previous_hash)], miner[sizeof(b->mined_by)];
-    copy_field(prev, sizeof(prev), b->previous_hash);
-    copy_field(miner, sizeof(miner), b->mined_by);
-    return pow_mine(b, b->index, prev, b->difficulty, miner);
+void chain_print_block(const Blockchain *chain, int index) {
+    if (index < 0 || index >= chain->count) {
+        printf("ERROR: No block #%d (chain has %d block(s))\n", index, chain->count);
+        return;
+    }
+    const Block *b = &chain->blocks[index];
+    char ts[24];
+    format_datetime(b->timestamp, ts, sizeof(ts));
+    printf("\n=== Block #%d ===\n", b->index);
+    printf("  timestamp      : %s (%ld)\n", ts, (long)b->timestamp);
+    printf("  record_count   : %d\n", b->record_count);
+    printf("  previous_hash  : %s\n", b->previous_hash);
+    printf("  merkle_root    : %s\n", b->merkle_root);
+    printf("  hash           : %s\n", b->hash);
+    printf("  sealed_by      : %s\n", b->sealed_by);
+    printf("  token_reward   : %d\n", b->token_reward);
+    printf("  transaction_id : %s\n", b->transaction_id);
+    printf("  difficulty     : %d   nonce: %llu\n", b->difficulty, b->nonce);
+    if (b->record_count > 0) {
+        printf("  Records:\n");
+        record_print_header("    ");
+        for (int r = 0; r < b->record_count; r++) {
+            const LendingRecord *rec = &b->records[r];
+            record_print_row(rec, "    ");
+            printf("      signature %s (key %.16s...), condition %s%s%s",
+                   record_signature_valid(rec) ? "VALID" : "INVALID", rec->signer_pubkey,
+                   condition_name(rec->condition), rec->reason_code[0] ? ", reason " : "",
+                   rec->reason_code);
+            if (strcmp(b->reward_txids[r], ZERO_HASH) != 0) {
+                printf(", reward tx %.16s...", b->reward_txids[r]);
+            }
+            if (strcmp(rec->tx_id, ZERO_HASH) != 0) printf(", tx %.16s...", rec->tx_id);
+            printf("\n");
+        }
+    }
+    merkle_print_tree(b->records, b->record_count);
 }
