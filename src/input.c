@@ -115,3 +115,86 @@ int prompt_int_range(const char *prompt, int min, int max, int default_value, in
         printf("ERROR: Please enter a number from %d to %d.\n", min, max);
     }
 }
+
+/* ======================= Command-line style input ======================= */
+
+int tokenize(char *line, char **argv, int max) {
+    int argc = 0;
+    char *p = line;
+    while (*p && argc < max) {
+        while (isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+        if (*p == '"') {
+            argv[argc++] = ++p;
+            while (*p && *p != '"') p++;
+        } else {
+            argv[argc++] = p;
+            while (*p && !isspace((unsigned char)*p)) p++;
+        }
+        if (*p) *p++ = '\0';
+    }
+    return argc;
+}
+
+/* The i-th positional word (1-based), skipping key=value options. */
+const char *cli_positional(int argc, char **argv, int i) {
+    int n = 0;
+    for (int k = 1; k < argc; k++) {
+        if (strchr(argv[k], '=') != NULL) continue;
+        if (++n == i) return argv[k];
+    }
+    return NULL;
+}
+
+int cli_arg(int argc, char **argv, int i, const char *prompt, char *buf, size_t size) {
+    const char *word = cli_positional(argc, argv, i);
+    if (word) {
+        if (strlen(word) >= size) {
+            printf("ERROR: Argument too long (max %zu characters)\n", size - 1);
+            return 0;
+        }
+        snprintf(buf, size, "%s", word);
+    } else if (read_line(prompt, buf, size) != INPUT_OK) {
+        return 0;
+    }
+    trim_spaces(buf);
+    return buf[0] != '\0';
+}
+
+int cli_id_arg(int argc, char **argv, int i, const char *prompt, char *buf, size_t size) {
+    if (!cli_arg(argc, argv, i, prompt, buf, size)) return 0;
+    to_upper_trim(buf);
+    return buf[0] != '\0';
+}
+
+const char *cli_option(int argc, char **argv, const char *key) {
+    size_t n = strlen(key);
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], key, n) == 0 && argv[i][n] == '=') return argv[i] + n + 1;
+    }
+    return NULL;
+}
+
+int parse_date(const char *s, time_t *out) {
+    int y, m, d;
+    char extra;
+    if (strlen(s) != 10 || s[4] != '-' || s[7] != '-' ||
+        sscanf(s, "%4d-%2d-%2d%c", &y, &m, &d, &extra) != 3) return 0;
+    if (y < 1970 || y > 2100 || m < 1 || m > 12 || d < 1 || d > 31) return 0;
+
+    struct tm tm_value;
+    memset(&tm_value, 0, sizeof(tm_value));
+    tm_value.tm_year = y - 1900;
+    tm_value.tm_mon = m - 1;
+    tm_value.tm_mday = d;
+    tm_value.tm_hour = 23;
+    tm_value.tm_min = 59;
+    tm_value.tm_sec = 59;
+    tm_value.tm_isdst = -1;
+    time_t t = mktime(&tm_value);
+    /* mktime normalises 2026-02-30 to March 2nd: reject anything it moved. */
+    if (t == (time_t)-1 || tm_value.tm_year != y - 1900 || tm_value.tm_mon != m - 1 ||
+        tm_value.tm_mday != d) return 0;
+    *out = t;
+    return 1;
+}

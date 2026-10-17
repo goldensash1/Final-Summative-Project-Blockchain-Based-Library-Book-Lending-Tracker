@@ -40,4 +40,33 @@ int prompt_id(const char *prompt, char *buf, size_t size);
  * Returns 1 with *out set, or 0 on EOF. */
 int prompt_int_range(const char *prompt, int min, int max, int default_value, int *out);
 
+/* ---------------- Command-line style input (summative CLI) ---------------- */
+
+#include <time.h>
+
+#define CLI_MAX_ARGS 16
+
+/* Splits `line` in place into words; "double quoted text" is one word.
+ * Returns the number of words (at most max). */
+int tokenize(char *line, char **argv, int max);
+
+/* Positional argument i (1 = first word after the command; key=value
+ * options are skipped). If it was not typed, asks
+ * for it with `prompt`. Returns 1 if a non-empty value is in buf. */
+int cli_arg(int argc, char **argv, int i, const char *prompt, char *buf, size_t size);
+
+/* Same, upper-cased and without spaces (for IDs). */
+int cli_id_arg(int argc, char **argv, int i, const char *prompt, char *buf, size_t size);
+
+/* The i-th positional word if it was typed (never prompts), else NULL. */
+const char *cli_positional(int argc, char **argv, int i);
+
+/* Value of an optional "key=value" argument, or NULL. */
+const char *cli_option(int argc, char **argv, const char *key);
+
+/* Parses a well-formed calendar date "YYYY-MM-DD" (rejects e.g. 2026-02-30).
+ * The time is set to 23:59:59 local time (a book is due by the end of the
+ * day). Returns 1 on success. */
+int parse_date(const char *s, time_t *out);
+
 #endif

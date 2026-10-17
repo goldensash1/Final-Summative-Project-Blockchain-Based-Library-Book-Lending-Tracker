@@ -3,24 +3,41 @@
 
 #include "app.h"
 
-/* Lending actions. Each one signs a new block and puts it in the pending
- * pool; nothing reaches the chain (or changes a balance) until it is mined.
- * A return also creates the member's token reward transaction:
- *   on time -> 10 coins, late -> 5 coins (each minus the 1-coin fee). */
-void lending_borrow(App *app);
-void lending_return(App *app);
-void lending_overdue(App *app);   /* not returned: no transaction is created */
+/* Library commands. Each one that changes something creates a signed request
+ * and submits it to the pending pool (app_submit); nothing reaches the chain
+ * or changes a balance until it is mined. Member actions are signed with the
+ * member's own private key, librarian overrides with the librarian's. */
 
-void lending_list_books(App *app);
-void lending_list_members(App *app);
+/* Membership */
+void cmd_register_member(App *app, int argc, char **argv);
+void cmd_view_member(App *app, int argc, char **argv);
+void cmd_member_nonce(App *app, int argc, char **argv);
+void cmd_list_members(App *app, int argc, char **argv);
 
-/* The confirmed chain followed by the pending pool is one timeline: a book
- * borrowed in a pending block is already unavailable.
- * Returns the BORROWED block of the book's open loan (NULL if none), and
- * sets *pending to 1 if that block is not mined yet. */
-const Block *lending_active_loan(const App *app, const char *book_id, int *pending);
+/* Books and copies */
+void cmd_register_book(App *app, int argc, char **argv);
+void cmd_view_book(App *app, int argc, char **argv);
+void cmd_add_copy(App *app, int argc, char **argv);
+void cmd_view_copy(App *app, int argc, char **argv);
+void cmd_mark_lost(App *app, int argc, char **argv);
+void cmd_list_books(App *app, int argc, char **argv);
 
-/* Most recent block about the book (confirmed or pending), or NULL. */
-const Block *lending_latest(const App *app, const char *book_id, int *pending);
+/* Lending */
+void cmd_borrow_book(App *app, int argc, char **argv);
+void cmd_return_book(App *app, int argc, char **argv);
+void cmd_renew_book(App *app, int argc, char **argv);
+void cmd_reserve_book(App *app, int argc, char **argv);
+void cmd_reservation_status(App *app, int argc, char **argv);
+
+/* Fines and overdue */
+void cmd_check_overdue(App *app, int argc, char **argv);
+void cmd_view_fines(App *app, int argc, char **argv);
+void cmd_settle_fine(App *app, int argc, char **argv);
+void cmd_advance_days(App *app, int argc, char **argv);
+
+/* Audit */
+void cmd_lending_history(App *app, int argc, char **argv);
+void cmd_member_history(App *app, int argc, char **argv);
+void cmd_book_history(App *app, int argc, char **argv);
 
 #endif
