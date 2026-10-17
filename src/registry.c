@@ -140,3 +140,92 @@ Member *registry_find_member(Registry *reg, const char *member_id) {
     }
     return NULL;
 }
+
+/* ======================= Registration ======================= */
+
+int valid_entity_id(const char *id) {
+    size_t len = strlen(id);
+    if (len < 3 || len > 15 || !isalpha((unsigned char)id[0])) return 0;
+    for (size_t i = 0; i < len; i++) {
+        if (!isalnum((unsigned char)id[i])) return 0;
+    }
+    return 1;
+}
+
+int valid_text_field(const char *s, size_t max) {
+    size_t len = strlen(s);
+    if (len == 0 || len >= max) return 0;
+    for (size_t i = 0; i < len; i++) {
+        if (!isprint((unsigned char)s[i]) || s[i] == ',') return 0;
+    }
+    return 1;
+}
+
+static int append_line(const char *path, const char *a, const char *b, const char *c) {
+    FILE *fp = fopen(path, "a");
+    if (!fp) return 0;
+    int ok = fprintf(fp, "%s,%s,%s\n", a, b, c) > 0;
+    return fclose(fp) == 0 && ok;
+}
+
+int registry_add_member(Registry *reg, const char *path, const char *id, const char *name,
+                        const char *course, char *err, size_t err_size) {
+    if (!valid_entity_id(id)) {
+        snprintf(err, err_size, "invalid member ID '%s' (3-15 letters/digits, starting with a letter)", id);
+        return 0;
+    }
+    if (registry_find_member(reg, id)) {
+        snprintf(err, err_size, "member ID %s is already registered", id);
+        return 0;
+    }
+    if (!valid_text_field(name, sizeof(reg->members[0].full_name)) ||
+        !valid_text_field(course, sizeof(reg->members[0].course_code))) {
+        snprintf(err, err_size, "name (max 49) and course code (max 9) must be non-empty, without commas");
+        return 0;
+    }
+    if (reg->member_count >= MAX_MEMBERS) {
+        snprintf(err, err_size, "member registry is full");
+        return 0;
+    }
+    if (!append_line(path, id, name, course)) {
+        snprintf(err, err_size, "could not write %s", path);
+        return 0;
+    }
+    Member *m = &reg->members[reg->member_count++];
+    memset(m, 0, sizeof(*m));
+    copy_field(m->member_id, sizeof(m->member_id), id);
+    copy_field(m->full_name, sizeof(m->full_name), name);
+    copy_field(m->course_code, sizeof(m->course_code), course);
+    return 1;
+}
+
+int registry_add_book(Registry *reg, const char *path, const char *id, const char *title,
+                      const char *author, char *err, size_t err_size) {
+    if (!valid_entity_id(id)) {
+        snprintf(err, err_size, "invalid book ID '%s' (3-15 letters/digits, starting with a letter)", id);
+        return 0;
+    }
+    if (registry_find_book(reg, id)) {
+        snprintf(err, err_size, "book ID %s is already registered", id);
+        return 0;
+    }
+    if (!valid_text_field(title, sizeof(reg->books[0].title)) ||
+        !valid_text_field(author, sizeof(reg->books[0].author))) {
+        snprintf(err, err_size, "title (max 79) and author (max 49) must be non-empty, without commas");
+        return 0;
+    }
+    if (reg->book_count >= MAX_BOOKS) {
+        snprintf(err, err_size, "book registry is full");
+        return 0;
+    }
+    if (!append_line(path, id, title, author)) {
+        snprintf(err, err_size, "could not write %s", path);
+        return 0;
+    }
+    Book *b = &reg->books[reg->book_count++];
+    memset(b, 0, sizeof(*b));
+    copy_field(b->book_id, sizeof(b->book_id), id);
+    copy_field(b->title, sizeof(b->title), title);
+    copy_field(b->author, sizeof(b->author), author);
+    return 1;
+}
