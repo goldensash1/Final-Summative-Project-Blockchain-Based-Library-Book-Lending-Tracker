@@ -64,8 +64,7 @@ DIST = Summative_Golden_Munyankindi.zip
 dist:
 	rm -f $(DIST)
 	zip -r $(DIST) Makefile README.md books.txt members.txt copies.txt .gitignore src tests docs \
-	    -x '*.DS_Store' 'docs/Technical Report - Formative 2*' 'docs/screenshots/*' 'docs/system_design.*' \
-	       'docs/demo_video_script.md'
+	    -x '*.DS_Store' 'docs/demo_video_script.md'
 
 # Saved state written by the program (see README, "Disk persistence").
 STATE_FILES = chain.dat pending.dat ledger.dat library_state.dat balances.dat utxo.dat meta.dat

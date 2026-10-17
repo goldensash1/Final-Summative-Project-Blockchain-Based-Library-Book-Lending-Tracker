@@ -53,7 +53,7 @@ gcc -Wall -Wextra -std=c11 -D_POSIX_C_SOURCE=200809L -I$(brew --prefix openssl@3
 ```
 
 The code compiles with no warnings. Run the program from the project folder so it finds `books.txt`,
-`members.txt` and `copies.txt`. Chain files from Formative 1 or 2 have a different format and are refused:
+`members.txt` and `copies.txt`. Chain files from older versions of the program have a different format and are refused:
 run `make clean` first.
 
 ## Run

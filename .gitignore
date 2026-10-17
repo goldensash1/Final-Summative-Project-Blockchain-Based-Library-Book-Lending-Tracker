@@ -8,7 +8,6 @@ keys/
 *.o
 ledger.dat
 ledger.dat.tmp
-Formative2_*.zip
 Summative_*.zip
 library_state.dat
 balances.dat
@@ -18,5 +17,3 @@ meta.dat
 
 # Personal notes, not part of the submission
 docs/demo_video_script.md
-docs/viva_questions.md
-docs/submission_checklist.md

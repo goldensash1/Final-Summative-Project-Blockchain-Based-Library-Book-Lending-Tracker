@@ -11,7 +11,7 @@
 #define NONCE_BUF 24
 
 /* "LBC3": the summative block layout (multi-record blocks with a Merkle
- * root). Files from Formative 1/2 ("LBC1"/"LBC2") are refused on load. */
+ * root). Files written by older versions ("LBC1"/"LBC2") are refused on load. */
 static const char CHAIN_MAGIC[4] = {'L', 'B', 'C', '3'};
 
 static void copy_field(char *dst, size_t dst_size, const char *src) {
