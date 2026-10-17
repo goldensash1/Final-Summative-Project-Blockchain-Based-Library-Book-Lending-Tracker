@@ -221,6 +221,13 @@ mv copies.txt copies.bak
 printf '%sexit\n' "$LOGIN" | run out20 --model utxo
 check "missing copies.txt reported"                 "Could not open copy inventory file 'copies.txt'" out20
 mv copies.bak copies.txt
+cp books.txt books.bak && cp members.txt members.bak
+printf '12,Bad ID,Nobody\n' >> books.txt
+printf 'ALU009,Too Long Course,ABCDEFGHIJKLMNOP\n' >> members.txt
+printf '%sexit\n' "$LOGIN" | run out21 --model utxo
+check "invalid book ID in books.txt skipped"        "Invalid book on line [0-9]+ skipped" out21
+check "invalid member in members.txt skipped"       "Invalid member on line [0-9]+ skipped" out21
+mv books.bak books.txt && mv members.bak members.txt
 
 echo
 echo "Result: $PASS passed, $FAIL failed"

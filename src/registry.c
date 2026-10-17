@@ -86,6 +86,12 @@ static int add_book(void *ctx, char *f[3], int line_no) {
         printf("WARNING: Book registry full (max %d), ignoring line %d\n", MAX_BOOKS, line_no);
         return 0;
     }
+    if (!valid_entity_id(f[0]) || !valid_text_field(f[1], sizeof(reg->books[0].title)) ||
+        !valid_text_field(f[2], sizeof(reg->books[0].author))) {
+        printf("WARNING: Invalid book on line %d skipped (ID must be 3-15 letters/digits starting "
+               "with a letter; title max 79, author max 49 characters)\n", line_no);
+        return 0;
+    }
     if (registry_find_book(reg, f[0])) {
         printf("WARNING: Duplicate book ID '%s' on line %d ignored\n", f[0], line_no);
         return 0;
@@ -101,6 +107,12 @@ static int add_member(void *ctx, char *f[3], int line_no) {
     Registry *reg = ctx;
     if (reg->member_count >= MAX_MEMBERS) {
         printf("WARNING: Member registry full (max %d), ignoring line %d\n", MAX_MEMBERS, line_no);
+        return 0;
+    }
+    if (!valid_entity_id(f[0]) || !valid_text_field(f[1], sizeof(reg->members[0].full_name)) ||
+        !valid_text_field(f[2], sizeof(reg->members[0].course_code))) {
+        printf("WARNING: Invalid member on line %d skipped (ID must be 3-15 letters/digits starting "
+               "with a letter; name max 49, course code max 9 characters)\n", line_no);
         return 0;
     }
     if (registry_find_member(reg, f[0])) {
