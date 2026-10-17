@@ -1,42 +1,66 @@
 #ifndef PENDING_H
 #define PENDING_H
 
-#include "blockchain.h"
+#include "record.h"
 #include "transaction.h"
 #include "storage.h"
 
-/* An unconfirmed lending block waiting to be mined. The librarian has
- * already signed its content; the miner will later set its index,
- * previous_hash, difficulty and nonce. A RETURNED block carries the reward
- * transaction it created (a TRANSFER block carries the transfer). */
-typedef struct {
-    Block block;
-    int has_tx;
-    Transaction tx;
-} PendingEntry;
+typedef enum {
+    REQ_PENDING = 0,
+    REQ_CONFIRMED,     /* included in a mined block (then removed from the pool) */
+    REQ_SUSPICIOUS     /* flagged by a fraud heuristic: never mined until approved */
+} RequestStatus;
 
-/* FIFO queue of pending blocks (persisted to pending.dat). */
+/* Priority classes: lower is served first. */
+#define PRIORITY_OVERDUE 0   /* returns / fine settlements on already-overdue copies, overdue flags */
+#define PRIORITY_NORMAL 1
+
+/* A signed lending request waiting to be mined. request_id, book_id,
+ * copy_id, member_id and action_requested are the fields of `rec`
+ * (record_id, book_id, copy_id, member_id, action). */
 typedef struct {
-    PendingEntry *items;
+    LendingRecord rec;
+    int status;               /* RequestStatus */
+    int priority;             /* PRIORITY_* */
+    time_t waiting_since;     /* reservation date (or submission time): tie-break, oldest first */
+    long seq;                 /* submission order */
+    int approved;             /* a librarian approved it in fraud review */
+    int is_duplicate;         /* replay of an existing request_id (can only be rejected) */
+    char flag_reason[160];    /* why it was flagged SUSPICIOUS */
+    int has_tx;               /* TRANSFER / FINE_PAID carry a token transaction */
+    Transaction tx;
+} PendingRequest;
+
+/* The pool keeps submission order in memory and on disk; the priority order
+ * is computed whenever it is needed (pool_view, mining). */
+typedef struct {
+    PendingRequest *items;
     int count;
     int capacity;
 } PendingPool;
 
+const char *request_status_name(int status);
+
 int pending_init(PendingPool *pool);
 void pending_free(PendingPool *pool);
-
-/* Appends an entry at the back. Returns 1 on success. */
-int pending_push(PendingPool *pool, const PendingEntry *entry);
-
-/* Removes entry i, keeping the order of the rest. */
+int pending_push(PendingPool *pool, const PendingRequest *req);
 void pending_remove(PendingPool *pool, int i);
 
-int pending_save(const PendingPool *pool, const char *path);
+/* Index of the request with this ID, or -1. */
+int pending_find(const PendingPool *pool, const char *request_id);
 
-/* Loads the pool. Returns STORAGE_MISSING if there is no file yet. */
+/* Same, ignoring replayed duplicates (which share the original's ID). */
+int pending_find_genuine(const PendingPool *pool, const char *request_id);
+
+/* Fills order[] with the pool's indices sorted by priority: overdue-related
+ * requests first, then oldest reservation/waiting date, then submission
+ * order. Returns the count. */
+int pending_priority_order(const PendingPool *pool, int *order);
+
+int pending_save(const PendingPool *pool, const char *path);
 StorageResult pending_load(PendingPool *pool, const char *path);
 
-/* Prints every block waiting to be mined. */
-void pending_print(const PendingPool *pool, int difficulty);
+/* Prints the pool in priority order (both PENDING and SUSPICIOUS). */
+void pending_print(const PendingPool *pool, int batch_size, int difficulty);
 
 #endif

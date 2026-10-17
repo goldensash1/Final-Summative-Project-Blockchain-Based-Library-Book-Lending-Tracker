@@ -116,6 +116,23 @@ int ledger_confirm(Ledger *ledger, Transaction *tx, int was_admitted, char *err,
     return 1;
 }
 
+int ledger_rollback(Ledger *ledger, int keep_count) {
+    if (keep_count < 0 || keep_count > ledger->log_count) return 0;
+    Transaction *kept = malloc(sizeof(Transaction) * (size_t)(keep_count > 0 ? keep_count : 1));
+    if (!kept) return 0;
+    memcpy(kept, ledger->log, sizeof(Transaction) * (size_t)keep_count);
+
+    LedgerModel model = ledger->model;
+    ledger_free(ledger);
+    int ok = ledger_init(ledger, model);
+    for (int i = 0; ok && i < keep_count; i++) {
+        char err[256];
+        ok = ledger_confirm(ledger, &kept[i], 0, err, sizeof(err));
+    }
+    free(kept);
+    return ok;
+}
+
 StorageResult ledger_load(Ledger *ledger, const char *path) {
     void *records = NULL;
     int count = 0;

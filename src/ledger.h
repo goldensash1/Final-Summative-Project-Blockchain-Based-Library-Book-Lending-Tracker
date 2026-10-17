@@ -63,6 +63,12 @@ void ledger_release(Ledger *ledger, const Transaction *tx);
  * Returns 1, or 0 with the reason in err (nothing changed). */
 int ledger_confirm(Ledger *ledger, Transaction *tx, int was_admitted, char *err, size_t err_size);
 
+/* Undoes the confirmation of every transaction after the first `keep_count`
+ * by rebuilding the model from the shortened log. Pending reservations are
+ * cleared too, so the caller re-admits the pending transactions afterwards.
+ * Used when a block's transactions cannot all be confirmed. */
+int ledger_rollback(Ledger *ledger, int keep_count);
+
 /* Returns the confirmed transaction with this ID, or NULL. */
 const Transaction *ledger_find_tx(const Ledger *ledger, const char *txid);
 
