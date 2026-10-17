@@ -1,0 +1,64 @@
+ -- Membership --
+  register_member <id> "<name>" <course>                         register a member (generates their ECDSA keys)
+  view_member <member_id>                                        member details, loans, fines, nonce, balance
+  member_nonce <member_id>                                       request nonce (replay protection)
+  list_members                                                   all members
+
+ -- Books & copies --
+  register_book <id> "<title>" "<author>" [copies=N]             register a title
+  view_book <book_id>                                            title, copies and reservation queue
+  add_copy <book_id> [NEW|GOOD|WORN]                             add a physical copy
+  view_copy <copy_id>                                            copy state and history
+  mark_lost <copy_id> <reason_code>                              librarian override: copy -> LOST
+  list_books                                                     all titles with copy counts
+
+ -- Lending --
+  borrow_book <member_id> <book_id|copy_id> [due=YYYY-MM-DD] [nonce=N] borrow an available copy
+  return_book <copy_id> [NEW|GOOD|WORN] [reason=CODE]            return a copy (reward 10 on time / 5 late)
+  renew_book <copy_id>                                           extend the due date by 7 days (max 2)
+  reserve_book <member_id> <book_id>                             join the queue when no copy is available
+  reservation_status [book_id]                                   reservation queues and held copies
+
+ -- Fines & overdue --
+  check_overdue                                                  flag overdue copies and list accrued fines
+  view_fines [member_id]                                         fines owed, paid and accruing
+  settle_fine <member_id> [amount] [method=tokens|cash]          pay a fine
+  advance_days <n>                                               move the simulated library clock forward [ADMIN]
+
+ -- Tokens & ledger --
+  token_transfer <from> <to> <amount>                            transfer tokens (session model)
+  token_balance [account]                                        balance of one account (or all)
+  utxo_view [owner]                                              the UTXO set (UTXO model)
+  account_balance [account]                                      account balances (account model)
+  account_transfer <from> <to> <amount> [nonce]                  transfer with an explicit nonce (account model)
+  account_nonce <account>                                        account transaction nonce
+  transaction_history <member_id>                                an account's transaction history
+  replay_tx <txid-prefix>                                        replay a confirmed tx (double-spend / nonce test)
+
+ -- Chain & mining --
+  pool_view                                                      pending pool in priority order
+  mine_solo                                                      mine all PENDING requests alone
+  mine_pool [miners 2-8]                                         pool mining with reward-sharing table
+  mine_cloud <rounds 1-5>                                        rent hash power for 1-5 rounds
+  chain_view [index]                                             all blocks, or one block with records + Merkle tree
+  validate_chain                                                 full chain verification and tamper detection
+  chain_save                                                     save all state to disk now
+  chain_load                                                     reload all state from disk and re-validate
+  difficulty_status                                              difficulty, target and expected attempts
+  set_difficulty <1-4>                                           change the difficulty [ADMIN]
+  benchmark                                                      average attempts at difficulty 1-4
+
+ -- Fraud & audit --
+  fraud_review                                                   list SUSPICIOUS requests
+  approve_suspicious <id>                                        approve a flagged request for mining
+  reject_suspicious <id>                                         discard a flagged request
+  replay_request <id>                                            replay a captured request (duplicate test)
+  lending_history                                                every lending record
+  member_history <member_id>                                     records of one member
+  book_history <book_id|copy_id>                                 records of one title or copy
+  tamper_block <index> <record|header|remine>                    tamper demo, in memory [ADMIN]
+
+ -- Session --
+  add_user                                                       create a librarian/admin account [ADMIN]
+  help                                                           this list
+  exit                                                           save and quit (also: quit)
